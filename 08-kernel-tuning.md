@@ -14,9 +14,10 @@ sysctl -p /etc/sysctl.d/99-custom.conf  # Reload specific file
 
 Persistent settings: `/etc/sysctl.conf` or `/etc/sysctl.d/*.conf`
 
-## CPU Tuning
+## CPU Scheduling
 
 ### CPU Governor
+
 ```bash
 # Check current
 cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
@@ -74,6 +75,97 @@ sysctl kernel.sched_migration_cost_ns=500000      # Migration cost
 sysctl kernel.sched_autogroup_enabled=0           # Disable autogroup (servers)
 ```
 
+### sched_ext (SCX): Pluggable BPF Schedulers
+
+sched_ext allows loading custom schedulers as BPF programs at runtime without kernel recompilation. Available since kernel 6.12.
+
+```bash
+# Install sched_ext schedulers (from scx repo)
+git clone https://github.com/sched-ext/scx
+cd scx && meson build && ninja -C build
+
+# Load latency-optimized scheduler for gaming
+sudo scx_lavd
+
+# Load for better throughput
+sudo scx_rusty
+
+# Stop and revert to default scheduler
+# Ctrl+C or kill the scheduler process
+```
+
+**Gaming performance metrics:**
+- Track P99 frame times, not just average FPS
+- Consistent 55 FPS beats variable 30-70 FPS
+- Frame time = 1000ms / FPS (16.6ms for 60 FPS)
+
+**Key insight:** Latency-sensitive tasks (games, compositors) benefit from deadline-based scheduling that prioritizes short CPU bursts over fairness.
+
+### Custom Scheduler for Concurrency Testing
+
+sched_ext enables deliberately erratic scheduling to expose race conditions that are hard to reproduce.
+
+```bash
+# Simple SCX scheduler structure
+# init(): create dispatch queue
+# enqueue(): add task to queue with timeslice
+# dispatch(): consume from queue to CPU
+
+# Force race conditions by:
+# - Random sleep delays before scheduling
+# - Very short timeslices
+# - Aggressive preemption
+
+# SCX safety: auto-eject after 30s without scheduling
+# Soft lockup detector kicks in at ~45s
+```
+
+**Key insight:** Bad schedulers expose latent bugs. Use SCX to deliberately delay scheduling and make race conditions reproducible.
+
+### PREEMPT_RT Real-Time Kernel
+
+PREEMPT_RT merged into mainline kernel 6.12+ for x86, ARM64, and RISC-V. Converts spinlocks to preemptible mutexes for bounded latency.
+
+```bash
+# Check if running RT kernel
+uname -a  # Look for PREEMPT_RT
+
+# Enable at build time
+make menuconfig
+# General setup -> Preemption Model -> Fully Preemptible (RT)
+
+# Real-time task setup
+#include <sched.h>
+struct sched_param param = { .sched_priority = 80 };
+sched_setscheduler(0, SCHED_FIFO, &param);
+mlockall(MCL_CURRENT | MCL_FUTURE);  # Lock memory
+
+# Test latency with cyclictest
+cyclictest -p 80 -t 4 -n -l 1000000
+# Target: <100us on x86, <200us on embedded
+```
+
+**Key insight:** RT is not about speed, it's about bounded worst-case latency. Expect ~80us max latency on x86 with proper configuration.
+
+### SCHED_DEADLINE Real-Time Scheduling
+
+SCHED_DEADLINE provides hard real-time guarantees with admission control.
+
+```c
+#include <linux/sched.h>
+
+struct sched_attr attr = {
+    .size = sizeof(attr),
+    .sched_policy = SCHED_DEADLINE,
+    .sched_runtime = 10000000,   // 10ms worst-case runtime
+    .sched_deadline = 30000000,  // 30ms deadline
+    .sched_period = 100000000,   // 100ms period
+};
+sched_setattr(0, &attr, 0);
+```
+
+**Key insight:** Kernel performs admission test on sched_setattr(). If total utilization exceeds capacity, the call fails. Exceeding runtime triggers SIGXCPU.
+
 ### NUMA
 
 ```bash
@@ -91,7 +183,7 @@ numactl --interleave=all ./application
 sysctl vm.numa_balancing=0
 ```
 
-## Memory Tuning
+## Memory Management
 
 ### Virtual Memory
 
@@ -172,6 +264,78 @@ cat /proc/PID/oom_score
 # Disable zone reclaim (NUMA optimization)
 sysctl vm.zone_reclaim_mode=0
 ```
+
+### DAMON: Data Access Monitoring
+
+DAMON monitors memory access patterns with configurable accuracy/overhead tradeoff. Uses region-based sampling instead of per-page tracking for scalability.
+
+```bash
+# Install DAMON userspace tools
+apt install damon-tools
+
+# Start monitoring a process
+damo start --target_pid <PID>
+
+# Show access pattern (regions, frequency, age)
+damo show
+
+# Proactive reclaim: evict cold pages before memory pressure
+damo schemes --action pageout \
+    --access_pattern "0 0 5min max" \
+    --quotas "100M/s 2%"
+
+# DAMON schemes for memory tiering
+# Move hot pages to faster NUMA node
+damo schemes --action migrate_hot \
+    --access_pattern "10 max 0 1s"
+```
+
+**Key insight:** DAMON enables proactive memory management based on actual access patterns, not just LRU heuristics. Typical overhead is 3-4% single CPU usage.
+
+### Per-CPU Memory Allocation (librseq)
+
+Per-CPU data avoids cache line bouncing between cores. librseq provides userspace per-CPU allocator with restartable sequences.
+
+```bash
+# Check rseq support
+cat /proc/self/rseq
+
+# rseq concurrency ID (Linux 6.3+)
+# Provides process-local CPU index for compact per-CPU arrays
+```
+
+**Design patterns:**
+```c
+// Anti-pattern: array indexed by CPU
+data[sched_getcpu()];  // Cache line bouncing
+
+// Better: per-CPU memory pools
+// All CPU0 data together, all CPU1 data together
+// Stride = pool_size, not element_size
+
+// rseq critical section
+// If preempted/migrated, aborts and retries
+```
+
+**Key insight:** Per-CPU allocation with copy-on-write init values avoids touching memory for unused CPUs in containers.
+
+### Buddy Allocator with Bitmap Indexing
+
+Buddy allocator using pure bitmaps instead of linked lists. Fixed overhead: 2 bits per minimum page.
+
+```
+Overhead calculation:
+- 4KB pages: 0.006% overhead (65GB to manage 1PB)
+- 256B pages: 0.1% overhead
+
+Key operations (all O(1)):
+- Free: set bit
+- Take: clear bit
+- Split: take parent, free right child
+- Merge: check buddy bit, take if free, recurse up
+```
+
+**Key insight:** For disk/cache allocators, bitmap-based buddy allocator enables defragmentation through selective eviction until pages coalesce.
 
 ## I/O Tuning
 
@@ -267,7 +431,50 @@ ulimit -n 65535
 *    hard    nproc     65535
 ```
 
-## Kernel Parameters Reference
+## Kernel Livepatching
+
+TuxTape automates CVE patch generation and deployment using kpatch. Tracks Linux CNA (CVE Naming Authority) for fix commits.
+
+```bash
+# kpatch redirects vulnerable functions via ftrace
+# Patches must not change stack frame size
+
+# CVE triage workflow:
+# 1. Parse Linux CNA YAML files
+# 2. Generate git diff of fix commit
+# 3. Check if affected files in kernel config
+# 4. Convert to kpatch-compatible module
+
+# Profile kernel build to find included files
+remake --profile  # JSON output of compiled files
+```
+
+**Key insight:** Not all CVEs affect your kernel. Profile build to identify which source files are actually compiled into your config.
+
+## HPC Optimizations
+
+Tested AVX-512, O3, and profile-guided optimization (PGO) on HPC workloads.
+
+```bash
+# Kernel compile with native CPU features
+make KCFLAGS="-march=native"
+
+# Profile-guided optimization
+# 1. Build with coverage
+make KCFLAGS="-fprofile-generate"
+# 2. Run workload
+# 3. Rebuild with profile
+make KCFLAGS="-fprofile-use"
+
+# Results:
+# - AVX-512: negligible average improvement
+# - O3 vs O2: mixed results, some regressions
+# - PGO: 1-3% improvement on targeted workloads
+```
+
+**Key insight:** Kernel instruction set optimization shows minimal gains for well-optimized userspace HPC code. PGO provides modest improvement but requires workflow-specific profiling.
+
+## sysctl Reference
 
 ### Critical for Performance
 
@@ -343,220 +550,3 @@ tuned-adm recommend
 | NVMe scheduler | `echo none > /sys/block/nvme0n1/queue/scheduler` |
 | Disable IRQ balance | `systemctl stop irqbalance` |
 | More file descriptors | `fs.file-max=2000000` |
-
-## FOSDEM Insights
-
-### DAMON: Data Access Monitoring
-Source: FOSDEM 2025 - DAMON Kernel Subsystem for Data Access Monitoring
-
-DAMON monitors memory access patterns with configurable accuracy/overhead tradeoff. Uses region-based sampling instead of per-page tracking for scalability.
-
-```bash
-# Install DAMON userspace tools
-apt install damon-tools
-
-# Start monitoring a process
-damo start --target_pid <PID>
-
-# Show access pattern (regions, frequency, age)
-damo show
-
-# Proactive reclaim: evict cold pages before memory pressure
-damo schemes --action pageout \
-    --access_pattern "0 0 5min max" \
-    --quotas "100M/s 2%"
-
-# DAMON schemes for memory tiering
-# Move hot pages to faster NUMA node
-damo schemes --action migrate_hot \
-    --access_pattern "10 max 0 1s"
-```
-
-**Key insight:** DAMON enables proactive memory management based on actual access patterns, not just LRU heuristics. Typical overhead is 3-4% single CPU usage.
-
-### sched_ext (SCX): Pluggable BPF Schedulers
-Source: FOSDEM 2025 - Level Up Your Linux Gaming with sched_ext
-
-sched_ext allows loading custom schedulers as BPF programs at runtime without kernel recompilation. Available since kernel 6.12.
-
-```bash
-# Install sched_ext schedulers (from scx repo)
-git clone https://github.com/sched-ext/scx
-cd scx && meson build && ninja -C build
-
-# Load latency-optimized scheduler for gaming
-sudo scx_lavd
-
-# Load for better throughput
-sudo scx_rusty
-
-# Stop and revert to default scheduler
-# Ctrl+C or kill the scheduler process
-```
-
-**Gaming performance metrics:**
-- Track P99 frame times, not just average FPS
-- Consistent 55 FPS beats variable 30-70 FPS
-- Frame time = 1000ms / FPS (16.6ms for 60 FPS)
-
-**Key insight:** Latency-sensitive tasks (games, compositors) benefit from deadline-based scheduling that prioritizes short CPU bursts over fairness.
-
-### PREEMPT_RT Real-Time Kernel
-Source: FOSDEM 2025 - Linux Kernel Mainline Real-Time
-
-PREEMPT_RT merged into mainline kernel 6.12+ for x86, ARM64, and RISC-V. Converts spinlocks to preemptible mutexes for bounded latency.
-
-```bash
-# Check if running RT kernel
-uname -a  # Look for PREEMPT_RT
-
-# Enable at build time
-make menuconfig
-# General setup -> Preemption Model -> Fully Preemptible (RT)
-
-# Real-time task setup
-#include <sched.h>
-struct sched_param param = { .sched_priority = 80 };
-sched_setscheduler(0, SCHED_FIFO, &param);
-mlockall(MCL_CURRENT | MCL_FUTURE);  # Lock memory
-
-# Test latency with cyclictest
-cyclictest -p 80 -t 4 -n -l 1000000
-# Target: <100μs on x86, <200μs on embedded
-```
-
-**Key insight:** RT is not about speed, it's about bounded worst-case latency. Expect ~80μs max latency on x86 with proper configuration.
-
-### Per-CPU Memory Allocation (librseq)
-Source: FOSDEM 2025 - Waste-Free Per-CPU Userspace Memory Allocation
-
-Per-CPU data avoids cache line bouncing between cores. librseq provides userspace per-CPU allocator with restartable sequences.
-
-```bash
-# Check rseq support
-cat /proc/self/rseq
-
-# rseq concurrency ID (Linux 6.3+)
-# Provides process-local CPU index for compact per-CPU arrays
-```
-
-**Design patterns:**
-```c
-// Anti-pattern: array indexed by CPU
-data[sched_getcpu()];  // Cache line bouncing
-
-// Better: per-CPU memory pools
-// All CPU0 data together, all CPU1 data together
-// Stride = pool_size, not element_size
-
-// rseq critical section
-// If preempted/migrated, aborts and retries
-```
-
-**Key insight:** Per-CPU allocation with copy-on-write init values avoids touching memory for unused CPUs in containers.
-
-### Custom Scheduler for Concurrency Testing
-Source: FOSDEM 2025 - Concurrency Testing Using Custom Linux Schedulers
-
-sched_ext enables deliberately erratic scheduling to expose race conditions that are hard to reproduce.
-
-```bash
-# Simple SCX scheduler structure
-# init(): create dispatch queue
-# enqueue(): add task to queue with timeslice
-# dispatch(): consume from queue to CPU
-
-# Force race conditions by:
-# - Random sleep delays before scheduling
-# - Very short timeslices
-# - Aggressive preemption
-
-# SCX safety: auto-eject after 30s without scheduling
-# Soft lockup detector kicks in at ~45s
-```
-
-**Key insight:** Bad schedulers expose latent bugs. Use SCX to deliberately delay scheduling and make race conditions reproducible.
-
-### Buddy Allocator with Bitmap Indexing
-Source: FOSDEM 2025 - A Memory Allocator with 0.006% Fixed Overhead
-
-Buddy allocator using pure bitmaps instead of linked lists. Fixed overhead: 2 bits per minimum page.
-
-```
-Overhead calculation:
-- 4KB pages: 0.006% overhead (65GB to manage 1PB)
-- 256B pages: 0.1% overhead
-
-Key operations (all O(1)):
-- Free: set bit
-- Take: clear bit
-- Split: take parent, free right child
-- Merge: check buddy bit, take if free, recurse up
-```
-
-**Key insight:** For disk/cache allocators, bitmap-based buddy allocator enables defragmentation through selective eviction until pages coalesce.
-
-### Kernel Livepatching with TuxTape
-Source: FOSDEM 2025 - TuxTape: A Kernel Livepatching Solution
-
-TuxTape automates CVE patch generation and deployment using kpatch. Tracks Linux CNA (CVE Naming Authority) for fix commits.
-
-```bash
-# kpatch redirects vulnerable functions via ftrace
-# Patches must not change stack frame size
-
-# CVE triage workflow:
-# 1. Parse Linux CNA YAML files
-# 2. Generate git diff of fix commit
-# 3. Check if affected files in kernel config
-# 4. Convert to kpatch-compatible module
-
-# Profile kernel build to find included files
-remake --profile  # JSON output of compiled files
-```
-
-**Key insight:** Not all CVEs affect your kernel. Profile build to identify which source files are actually compiled into your config.
-
-### HPC Kernel Optimization
-Source: FOSDEM 2025 - Effect of Kernel Optimizations on HPC Workloads
-
-Tested AVX-512, O3, and profile-guided optimization (PGO) on HPC workloads.
-
-```bash
-# Kernel compile with native CPU features
-make KCFLAGS="-march=native"
-
-# Profile-guided optimization
-# 1. Build with coverage
-make KCFLAGS="-fprofile-generate"
-# 2. Run workload
-# 3. Rebuild with profile
-make KCFLAGS="-fprofile-use"
-
-# Results:
-# - AVX-512: negligible average improvement
-# - O3 vs O2: mixed results, some regressions
-# - PGO: 1-3% improvement on targeted workloads
-```
-
-**Key insight:** Kernel instruction set optimization shows minimal gains for well-optimized userspace HPC code. PGO provides modest improvement but requires workflow-specific profiling.
-
-### SCHED_DEADLINE Real-Time Scheduling
-Source: FOSDEM 2026 - Externally Verifying Linux Scheduling
-
-SCHED_DEADLINE provides hard real-time guarantees with admission control.
-
-```c
-#include <linux/sched.h>
-
-struct sched_attr attr = {
-    .size = sizeof(attr),
-    .sched_policy = SCHED_DEADLINE,
-    .sched_runtime = 10000000,   // 10ms worst-case runtime
-    .sched_deadline = 30000000,  // 30ms deadline
-    .sched_period = 100000000,   // 100ms period
-};
-sched_setattr(0, &attr, 0);
-```
-
-**Key insight:** Kernel performs admission test on sched_setattr(). If total utilization exceeds capacity, the call fails. Exceeding runtime triggers SIGXCPU.

@@ -2,29 +2,40 @@
 
 GPU performance monitoring, HPC tracing, and accelerator debugging.
 
+---
+
 ## GPU Profiling Tools
+
+### nvidia-smi
+
+Basic GPU monitoring utility included with NVIDIA drivers.
+
+```bash
+nvidia-smi                        # Basic overview
+nvidia-smi -l 1                   # Refresh every second
+nvidia-smi -L                     # List GPU UUIDs
+nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv
+```
+
+**Limitations:** Shows utilization but not efficiency. 100% utilization does NOT mean 100% efficiency:
+- FP32 workloads may show 100% but use 0% tensor cores
+- FP16 workloads use tensor cores (8-10x faster than CUDA cores)
+
+**Key insight:** GPU utilization measures if SMs are doing work, not how much or how efficiently.
 
 ### NVIDIA DCGM (Data Center GPU Manager)
 
 Hardware-level GPU monitoring for data centers.
 
 ```bash
-# Install DCGM
+# Install and start
 apt install datacenter-gpu-manager
-
-# Start DCGM service
 systemctl start nvidia-dcgm
 
 # Basic monitoring
 dcgmi discovery -l              # List GPUs
 dcgmi dmon                      # Real-time monitoring
 dcgmi dmon -e 155,156,203,204   # Specific metrics by ID
-
-# Field Groups for monitoring
-# 155 = SM Activity
-# 156 = SM Occupancy
-# 203 = Tensor Active
-# 204 = DRAM Active
 ```
 
 **Key DCGM Metrics:**
@@ -42,29 +53,22 @@ dcgmi dmon -e 155,156,203,204   # Specific metrics by ID
 **Temperature Policy Monitoring:**
 
 ```bash
-# Set temperature alert at 60C
-dcgmi policy --set 60,0 --target temperature
-dcgmi policy --reg                # Register policy
-dcgmi policy --get                # Verify policy
-# Violations reported in real-time
+dcgmi policy --set 60,0 --target temperature  # Alert at 60C
+dcgmi policy --reg                            # Register policy
+dcgmi policy --get                            # Verify policy
 ```
 
-### NVIDIA SMI Limitations
+**Estimating TFLOPS:**
 
-`nvidia-smi` shows GPU utilization but **not efficiency**:
-
-- 100% utilization does NOT mean 100% efficiency
-- FP32 workloads may show 100% but use 0% tensor cores
-- FP16 workloads use tensor cores (8-10x faster than CUDA cores)
-
-```bash
-nvidia-smi                        # Basic overview
-nvidia-smi -l 1                   # Refresh every second
-nvidia-smi -L                     # List GPU UUIDs
-nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv
+```
+Estimated TFLOPS = Peak TFLOPS x SM Activity x SM Occupancy x Tensor Activity
 ```
 
-**Critical insight:** GPU utilization measures if SMs are doing work, not how much or how efficiently.
+Works for stable workloads; less accurate for bursty patterns.
+
+### nvtop
+
+Interactive GPU process viewer (like htop for GPUs).
 
 ### Profiling Tools Comparison
 
@@ -75,15 +79,135 @@ nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv
 | Nsight Compute | Kernel-level (SM detail) | Proprietary |
 | Nsight Systems | Micro-level profiling | Proprietary |
 
-### Estimating TFLOPS
+---
+
+## NVIDIA MIG (Multi-Instance GPU)
+
+Hardware-level GPU partitioning for isolation.
+
+### MIG vs MPS vs Time-Slicing
+
+| Feature | MIG | MPS | Time-Slicing |
+|---------|-----|-----|--------------|
+| Isolation | Hardware | Software | None |
+| Context Switch | None | Minimal | High |
+| Max Instances | 7 | Many | 1 active |
+| QoS Guarantee | Yes | No | No |
+| Use Case | Production | Dev/test | Single job |
+
+### MIG Concepts
+
+**Hierarchy:**
+1. GPU Instance (GI) - Memory + Compute slices
+2. Compute Instance (CI) - Allocated within GI
+
+**Slice allocation:** Memory first, then compute assigned.
+
+### MIG Configuration
+
+```bash
+# Enable MIG mode (requires reboot/reset)
+nvidia-smi -i 0 -mig 1
+
+# List available profiles
+nvidia-smi mig -lgip
+
+# Create GPU Instance (profile ID 9 = 3g.40gb on H100)
+nvidia-smi mig -cgi 9 -C            # Create GI + default CI
+nvidia-smi mig -cgi 9,9             # Two 3g.40gb instances
+
+# Create Compute Instance within GI
+nvidia-smi mig -i 0 -gi 0 -cci 0    # Full CI for GI 0
+
+# List instances
+nvidia-smi -L                        # Shows MIG UUIDs
+nvidia-smi mig -lgi                  # List GPU instances
+nvidia-smi mig -lci                  # List compute instances
+```
+
+**Run workload on MIG instance:**
+
+```bash
+export CUDA_VISIBLE_DEVICES=MIG-<uuid>
+python train.py
+```
+
+### MIG Partition Profiles (H100 80GB)
+
+| Profile | Memory | SMs | Use Case |
+|---------|--------|-----|----------|
+| 1g.10gb | ~10GB | 16 | Small inference |
+| 2g.20gb | ~20GB | 32 | Medium workloads |
+| 3g.40gb | ~40GB | 60 | Large models |
+| 4g.40gb | ~40GB | 60 | Balanced |
+| 7g.80gb | ~80GB | 132 | Full GPU |
+
+**Key insight:** Overhead exists. 7x 1g instances = ~70GB (10GB unused). 132 SMs / 7 = 18.8, rounded to 16 per instance.
+
+### MIG Partition Combinations
+
+**Efficient combinations (no wasted compute):**
+- 7x 1g.10gb
+- 1x 7g.80gb
+- 3x 2g.20gb + 1x 1g.10gb
+- 1x 4g.40gb + 1x 3g.40gb
+
+**Wasteful combinations (1 compute slice unused):**
+- 2x 3g.40gb (6/7 compute used)
+- 3x 2g.20gb (6/7 compute used)
+
+### MIG + MPS Hybrid
+
+```bash
+# MPS can run inside MIG instance
+export CUDA_VISIBLE_DEVICES=MIG-<uuid>
+nvidia-cuda-mps-control -d
+
+# Note: Cannot create MIG while MPS running
+echo quit | nvidia-cuda-mps-control
+```
+
+---
+
+## AMD GPU / ROCm
+
+### ROCm Open Source Stack
+
+AMD's GPU compute stack is fully open source.
+
+**Components:**
+- Kernel driver: `amdgpu` (in mainline Linux)
+- User space: `rocm` (GitHub)
+- ISA documentation: `amd.com/en/support/tech-docs`
+
+```bash
+# Installation
+apt install rocm-dev
+
+# GPU info
+rocm-smi
+rocminfo
+```
+
+### SIMT vs Vector Programming
+
+**SIMT (Single Instruction Multiple Thread):** CUDA/HIP programming model where scalar code implicitly operates on 32/64 lanes.
+
+**Direct vector approach:** Write explicit SIMD/vector code targeting GPU vector units.
 
 ```
-Estimated TFLOPS = Peak TFLOPS x SM Activity x SM Occupancy x Tensor Activity
+# SIMT model (implicit vectorization)
+int x = compute();  // Actually vector of 32/64 ints
+
+# Vector model (explicit)
+v32int x = vector_compute();
 ```
 
-Works for stable workloads; less accurate for bursty patterns.
+AMD's ISA allows both approaches; LLVM defaults to SIMT model.
 
-## eBPF for GPU Auto-Instrumentation
+---
+
+## eBPF for GPU Instrumentation
 
 ### Beyla GPU Probes (Grafana)
 
@@ -136,107 +260,18 @@ gpu_kernel_block_size
 **Stack Trace Capture:**
 
 ```c
-// BPF helper for call stack
 bpf_get_stack(ctx, stack, sizeof(stack), BPF_F_USER_STACK);
 ```
 
 Note: Frame pointers often optimized away; use DWARF unwinding for full stacks.
 
-## NVIDIA MIG (Multi-Instance GPU)
+---
 
-Hardware-level GPU partitioning for isolation.
+## HPC Tracing (LTTng)
 
-### MIG vs MPS vs Time-Slicing
+### LTTng Overview
 
-| Feature | MIG | MPS | Time-Slicing |
-|---------|-----|-----|--------------|
-| Isolation | Hardware | Software | None |
-| Context Switch | None | Minimal | High |
-| Max Instances | 7 | Many | 1 active |
-| QoS Guarantee | Yes | No | No |
-| Use Case | Production | Dev/test | Single job |
-
-### MIG Concepts
-
-**Hierarchy:**
-1. GPU Instance (GI) - Memory + Compute slices
-2. Compute Instance (CI) - Allocated within GI
-
-**Slice allocation:** Memory first, then compute assigned.
-
-### MIG Configuration
-
-```bash
-# Enable MIG mode (requires reboot/reset)
-nvidia-smi -i 0 -mig 1
-
-# List available profiles
-nvidia-smi mig -lgip
-
-# Create GPU Instance (profile ID 9 = 3g.40gb on H100)
-nvidia-smi mig -cgi 9 -C            # Create GI + default CI
-nvidia-smi mig -cgi 9,9             # Two 3g.40gb instances
-
-# Create Compute Instance within GI
-nvidia-smi mig -i 0 -gi 0 -cci 0    # Full CI for GI 0
-
-# List instances
-nvidia-smi -L                        # Shows MIG UUIDs
-nvidia-smi mig -lgi                  # List GPU instances
-nvidia-smi mig -lci                  # List compute instances
-```
-
-**Run workload on MIG instance:**
-
-```bash
-# Export MIG device UUID
-export CUDA_VISIBLE_DEVICES=MIG-<uuid>
-
-# Run application
-python train.py
-```
-
-### MIG Partition Profiles (H100 80GB)
-
-| Profile | Memory | SMs | Use Case |
-|---------|--------|-----|----------|
-| 1g.10gb | ~10GB | 16 | Small inference |
-| 2g.20gb | ~20GB | 32 | Medium workloads |
-| 3g.40gb | ~40GB | 60 | Large models |
-| 4g.40gb | ~40GB | 60 | Balanced |
-| 7g.80gb | ~80GB | 132 | Full GPU |
-
-**Overhead:** Not exact 1/7 division. 7x 1g instances = ~70GB (10GB unused). 132 SMs / 7 = 18.8, rounded to 16 per instance.
-
-### MIG Partition Combinations
-
-**Efficient combinations (no wasted compute):**
-- 7x 1g.10gb
-- 1x 7g.80gb
-- 3x 2g.20gb + 1x 1g.10gb
-- 1x 4g.40gb + 1x 3g.40gb
-
-**Wasteful combinations (1 compute slice unused):**
-- 2x 3g.40gb (6/7 compute used)
-- 3x 2g.20gb (6/7 compute used)
-
-### MIG + MPS Hybrid
-
-```bash
-# MPS can run inside MIG instance
-export CUDA_VISIBLE_DEVICES=MIG-<uuid>
-nvidia-cuda-mps-control -d
-
-# Note: Cannot create MIG while MPS running
-# Must stop MPS first
-echo quit | nvidia-cuda-mps-control
-```
-
-## HPC Tracing with LTTng
-
-### Exa-Tracer Architecture
-
-LTTng-based tracing for HPC supercomputers (El Capitan, Aurora scale).
+Low-overhead kernel/userspace tracing for HPC supercomputers (El Capitan, Aurora scale).
 
 **Instrumented Layers:**
 - HIP/HSA (AMD GPU runtime)
@@ -245,10 +280,10 @@ LTTng-based tracing for HPC supercomputers (El Capitan, Aurora scale).
 - MPI (OpenMPI, Cray MPI)
 - Linux Kernel
 
-**Installation:**
+**Setup:**
 
 ```bash
-# LTTng session daemon
+# Start session daemon
 lttng-sessiond --daemonize
 
 # Create trace session
@@ -301,8 +336,7 @@ babeltrace2 input-trace --output-format=ctf2 --output=output-trace
 
 ### Trace Compass Visualization
 
-Eclipse-based trace analyzer.
-
+Eclipse-based trace analyzer with:
 - Resource view (CPU states, frequency)
 - Control flow view (thread timeline)
 - Critical path analysis
@@ -319,28 +353,27 @@ LTTng-based instrumentation for Aurora (10K nodes, 9M cores).
 
 Instruments: OpenCL, Level Zero, CUDA Runtime, HIP, OpenMP Target.
 
-## HPC Cluster Monitoring
+---
+
+## Cluster Monitoring
 
 ### Cluster Cockpit
 
 Job-specific performance monitoring for HPC clusters.
 
 **Architecture:**
+
 ```
 [Metric Collector] --JSON--> [Metric Store] <--query-- [Backend/UI]
      (per node)               (in-memory)              (job archive)
 ```
 
-**Components:**
-
-```bash
-# Metric collector plugins
-- likwid    # Hardware performance counters
-- cpustat   # CPU load
-- memstat   # Memory usage
-- ibstat    # InfiniBand metrics
-- nvidia    # GPU metrics via NVML
-```
+**Metric collector plugins:**
+- `likwid` - Hardware performance counters
+- `cpustat` - CPU load
+- `memstat` - Memory usage
+- `ibstat` - InfiniBand metrics
+- `nvidia` - GPU metrics via NVML
 
 **Metrics tracked per job:**
 - CPU utilization (per core/socket/node)
@@ -349,7 +382,7 @@ Job-specific performance monitoring for HPC clusters.
 - Network I/O (InfiniBand)
 - GPU utilization (if applicable)
 
-### Puzzle Jobs (Automated Analysis)
+### Automated Job Analysis
 
 Rule-based job quality assessment.
 
@@ -373,7 +406,7 @@ Rule-based job quality assessment.
 - Memory underutilization
 - Network idle time
 
-**Deployment insight:** 20-50% of jobs show problematic behavior patterns.
+**Key insight:** 20-50% of jobs show problematic behavior patterns.
 
 ### Roofline Analysis
 
@@ -389,58 +422,25 @@ Spider/radar diagram for job efficiency:
 
 Full triangle = efficient resource utilization.
 
-## AMD GPU Internals
+---
 
-### ROCm Open Source Stack
+## Common Bottlenecks and Patterns
 
-AMD's GPU compute stack is fully open source.
+### GPU Training Failures
 
-**Components:**
-- Kernel driver: `amdgpu` (in mainline Linux)
-- User space: `rocm` (GitHub)
-- ISA documentation: `amd.com/en/support/tech-docs`
-
-```bash
-# ROCm installation
-apt install rocm-dev
-
-# GPU info
-rocm-smi
-rocminfo
-```
-
-### SIMT vs Vector Programming
-
-**SIMT (Single Instruction Multiple Thread):** CUDA/HIP programming model where scalar code implicitly operates on 32/64 lanes.
-
-**Direct vector approach:** Write explicit SIMD/vector code targeting GPU vector units.
-
-```
-# SIMT model (implicit vectorization)
-int x = compute();  // Actually vector of 32/64 ints
-
-# Vector model (explicit)
-v32int x = vector_compute();
-```
-
-AMD's ISA allows both approaches; LLVM defaults to SIMT model.
-
-## FOSDEM Insights
-
-### GPU Failure Rates (Meta Llama 3)
-
-From 16K GPU training over 54 days:
+Large-scale training statistics (16K GPUs over 54 days):
 - 58% of training stalls due to GPU issues
 - 1-3% GPU hardware failure rate (overheat, fall off bus)
 - eBPF cannot help with hardware errors
 
-### Key Monitoring Patterns
+### Memory-Bound Detection
 
-**CPU-GPU data transfer is the bottleneck:**
-- High SM occupancy + Low SM activity + High VRAM = Memory-bound
-- Typical for inference workloads
+**Pattern:** High SM occupancy + Low SM activity + High VRAM = Memory-bound
 
-**Tensor core utilization:**
+Typical for inference workloads where CPU-GPU data transfer is the bottleneck.
+
+### Tensor Core Utilization
+
 - FP32 defaults to CUDA cores (no tensor acceleration)
 - FP16/TF32 use tensor cores (8-10x speedup)
 - Check with DCGM metrics 203, 1001-1004
@@ -454,13 +454,14 @@ From 16K GPU training over 54 days:
 | Output | Aggregated stats | Event sequence |
 | Scale | Single job | Cluster-wide |
 
-Tracing excels at finding why resources are NOT being used (waiting, stalls, dependencies).
+**Key insight:** Tracing excels at finding why resources are NOT being used (waiting, stalls, dependencies).
 
-### References
+---
+
+## References
 
 - DCGM Exporter: `github.com/NVIDIA/dcgm-exporter`
 - Cluster Cockpit: `github.com/ClusterCockpit`
-- Exa-Tracer: LTTng + ROCm instrumentation
 - Beyla GPU: `github.com/grafana/beyla`
 - Azure HPC Node Health: `github.com/Azure/azurehpc`
 - TAPI: `github.com/argonne-lcf/THAPI`

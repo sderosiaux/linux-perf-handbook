@@ -1,6 +1,6 @@
 # Network Tuning
 
-TCP optimization, congestion control, and NUMA-aware networking.
+TCP optimization, congestion control, NUMA-aware networking, and protocol performance.
 
 ## TCP Congestion Control
 
@@ -323,7 +323,7 @@ tc qdisc add dev eth0 root tbf rate 100mbit burst 32kbit latency 400ms
 tc qdisc del dev eth0 root
 ```
 
-### iperf3 (bandwidth testing)
+### iperf3 (Bandwidth Testing)
 
 ```bash
 # Server
@@ -337,6 +337,197 @@ iperf3 -c server -R           # Reverse (server sends)
 iperf3 -c server -t 60        # 60 second test
 iperf3 -c server -b 1G        # 1 Gbps bandwidth
 ```
+
+## gRPC Optimization
+
+Default gRPC-Go uses reflection for marshalling, adding ~12% overhead. Replace with vtprotobuf for code-generated serialization.
+
+```bash
+# Install vtprotobuf plugin
+go install github.com/planetscale/vtprotobuf/cmd/protoc-gen-go-vtproto@latest
+
+# Generate with vtprotobuf
+protoc --go_out=. --go-grpc_out=. --go-vtproto_out=. myservice.proto
+```
+
+```go
+// Register faster codec (grpc-go)
+import "google.golang.org/grpc/encoding"
+
+type vtCodec struct{}
+func (vtCodec) Marshal(v interface{}) ([]byte, error) {
+    return v.(interface{ MarshalVT() ([]byte, error) }).MarshalVT()
+}
+func (vtCodec) Unmarshal(data []byte, v interface{}) error {
+    return v.(interface{ UnmarshalVT([]byte) error }).UnmarshalVT(data)
+}
+func init() { encoding.RegisterCodec(vtCodec{}) }
+```
+
+For streams, use `RecvMsg()` with pooled messages to avoid heap allocation per message. gRPC-go 1.66+ enables receive buffer pooling by default. For older versions:
+
+```go
+grpc.NewServer(grpc.ReadBufferSize(0)) // Enables experimental receive buffer pool
+```
+
+**Key insight:** Reducing allocations from 11 GB/s to 20 MB/s cut CPU usage by 50% for 5 Gbps throughput.
+
+## TLS/Crypto Acceleration
+
+VPP (Vector Packet Processing) TLS plugin can offload crypto to hardware using OpenSSL async jobs and DPDK crypto PMD.
+
+```bash
+# VPP config for async TLS
+tls {
+    async
+    engine openssl
+}
+
+# DPDK crypto device binding
+dpdk-devbind.py -b vfio-pci 0000:06:00.0  # crypto accelerator
+```
+
+Performance comparison (RSA-4K handshakes):
+- Software only: ~6-7 Gbps
+- Hardware accelerated with async: 20% higher throughput, 50% lower CPU
+
+**Key insight:** Async crypto jobs let the CPU continue application work while hardware processes RSA/AES, critical for TLS handshake-heavy workloads.
+
+## HTTP/2, HTTP/3, QUIC
+
+Real-world protocol performance from browser telemetry:
+
+| Protocol | Time to Request Start (75th percentile, Android) |
+|----------|--------------------------------------------------|
+| HTTP/1.1 | ~320ms |
+| HTTP/2   | ~260ms |
+| HTTP/3   | ~130ms |
+
+DNS over HTTPS (DoH) optimization:
+- Long-lived connections to DoH server are critical
+- Server-side: Set `TCP_NODELAY` on DoH endpoints
+- With QUIC 0-RTT, DoH latency matches legacy UDP DNS
+
+Current adoption (browser telemetry):
+- HTTPS: 98% of traffic
+- HTTP/3: 20-30% of connections
+- ECH (Encrypted Client Hello): 0.3% (low server support)
+- DoH: 12% of DNS queries
+
+**Key insight:** QUIC 0-RTT resumption eliminates handshake overhead, making encrypted DNS viable without latency penalty.
+
+## Link Aggregation/Bonding
+
+Linux kernel supports OVS-style balance-slb (source load balancing) without switch cooperation.
+
+```bash
+# New kernel transmit hash policy (kernel 6.x+)
+nmcli connection add type bond con-name bond0 ifname bond0 \
+    bond.options "mode=balance-xor,xmit_hash_policy=vlan+srcmac"
+
+# Enable balance-slb in NetworkManager
+nmcli connection modify bond0 bond.options \
+    "mode=balance-xor,xmit_hash_policy=vlan+srcmac,balance-slb=1"
+```
+
+nftables rules to prevent duplicate broadcast/multicast packets:
+```bash
+nft add table netdev bond_slb
+nft add set netdev bond_slb seen { type ether_addr . vlan_id \; flags dynamic,timeout \; timeout 30s \; }
+nft add chain netdev bond_slb ingress { type filter hook ingress device bond0 priority 0 \; }
+nft add rule netdev bond_slb ingress ether type vlan vlan id . ether saddr @seen drop
+nft add rule netdev bond_slb ingress ether type vlan vlan id . ether saddr update @seen
+```
+
+nftables 1.0.6+ added `destroy` command for idempotent cleanup:
+```bash
+nft destroy table netdev bond_slb  # No error if missing
+```
+
+**Key insight:** balance-slb enables multi-path without LACP, but requires nftables rules to deduplicate broadcast traffic arriving on multiple ports.
+
+## Latency Analysis Tools
+
+Tools for tracing packet latency through hypervisor to VM:
+
+```bash
+# pwru (Packet, Where Are You) - trace kernel functions per packet
+pwru --filter-dst-port 102 --output-tuple
+
+# bpftrace for latency measurement between kernel functions
+bpftrace -e '
+kprobe:skb_recv_done { @start[arg0] = nsecs; }
+kprobe:consume_skb {
+    $lat = nsecs - @start[arg0];
+    @latency = hist($lat / 1000);  // microseconds
+    delete(@start[arg0]);
+}'
+```
+
+SVTrace wrapper combines bpftrace with real-time visualization:
+```bash
+svtrace --live --interface eth0 --filter "ether proto 0x88ba"
+```
+
+Key optimizations for virtualized networks:
+- Isolate KVM vCPUs: `isolcpus=4-7` + `taskset -c 4-7 qemu-system-x86_64`
+- Set vhost thread priority higher than QEMU main thread
+- Result: Reduced latency from 200us to 40us for packet transit
+
+**Key insight:** OVS upcalls to userspace cause latency spikes. For real-time, use kernel datapath or avoid OVS entirely.
+
+## Traffic Fingerprinting
+
+nDPI library fingerprints OS/application from packet metadata without payload inspection.
+
+```bash
+# TCP fingerprint components
+# TTL range + Window size + TCP options + MSS
+# Example: Windows lacks TCP timestamps, Apple devices have distinct option ordering
+
+# View JA4 TLS fingerprint in Wireshark
+wireshark -Y "tls.handshake.type == 1" -T fields -e ja4.hash
+```
+
+TCP fingerprint detection:
+```bash
+# Detect high-speed scanners (masscan, zmap) - no TCP options
+tcpdump -n 'tcp[tcpflags] == tcp-syn and tcp[20:4] == 0'
+```
+
+JA4 TLS fingerprint (replaces JA3):
+- Sorts cipher suites/extensions to counter randomization (GREASE)
+- Format: `protocol_version + cipher_count + extension_count + sorted_ciphers_hash + sorted_extensions_hash`
+
+**Key insight:** Encrypted traffic still leaks client identity through TLS ClientHello structure, TCP options, and connection patterns.
+
+## Real-Time Video/Media
+
+RTCP feedback mechanisms for adaptive bitrate over unstable networks:
+
+| Feedback Type | Purpose | Latency Impact |
+|--------------|---------|----------------|
+| REMB (Receiver Estimated Max Bitrate) | Bandwidth estimation from inter-packet arrival | Proactive |
+| NACK | Request retransmission of lost packets | 1-2 frames |
+| PLI (Picture Loss Indication) | Request full keyframe (10x size) | 100-500ms |
+
+REMB bandwidth estimation:
+```
+# Detects buffer buildup before packet loss
+# If inter-packet arrival time grows -> network congestion imminent
+# Reduce bitrate proactively
+```
+
+Test results (race car at 160 kph, 12 cell handovers per lap):
+- Without RTCP adaptation: Frame rate drops to 0 frequently
+- With RTCP REMB + NACK: Constant frame rate, 50x reduction in frozen frames
+
+L4S (Low Latency Low Loss Scalable throughput):
+- RFC 8888 adds RTCP feedback for ECN congestion bits
+- Network equipment marks packets approaching queue limits
+- Enables earlier congestion detection than packet loss
+
+**Key insight:** Varying bitrate based on RTCP feedback maintains constant frame rate over unstable 5G; fixed bitrate causes frequent freezes.
 
 ## High-Performance Config
 
@@ -394,203 +585,3 @@ net.ipv4.ip_local_port_range = 1024 65535
 | Set RSS queues | `ethtool -L eth0 combined 8` |
 | Set ring buffer | `ethtool -G eth0 rx 4096` |
 | Enable TSO | `ethtool -K eth0 tso on` |
-
-## FOSDEM Insights
-
-### High-Performance gRPC in Go
-Source: FOSDEM 2025 - High Performance gRPC
-
-Default gRPC-Go uses reflection for marshalling, adding ~12% overhead. Replace with vtprotobuf for code-generated serialization.
-
-```bash
-# Install vtprotobuf plugin
-go install github.com/planetscale/vtprotobuf/cmd/protoc-gen-go-vtproto@latest
-
-# Generate with vtprotobuf
-protoc --go_out=. --go-grpc_out=. --go-vtproto_out=. myservice.proto
-```
-
-```go
-// Register faster codec (grpc-go)
-import "google.golang.org/grpc/encoding"
-
-type vtCodec struct{}
-func (vtCodec) Marshal(v interface{}) ([]byte, error) {
-    return v.(interface{ MarshalVT() ([]byte, error) }).MarshalVT()
-}
-func (vtCodec) Unmarshal(data []byte, v interface{}) error {
-    return v.(interface{ UnmarshalVT([]byte) error }).UnmarshalVT(data)
-}
-func init() { encoding.RegisterCodec(vtCodec{}) }
-```
-
-For streams, use `RecvMsg()` with pooled messages to avoid heap allocation per message. gRPC-go 1.66+ enables receive buffer pooling by default. For older versions:
-
-```go
-grpc.NewServer(grpc.ReadBufferSize(0)) // Enables experimental receive buffer pool
-```
-
-**Key insight:** Reducing allocations from 11 GB/s to 20 MB/s cut CPU usage by 50% for 5 Gbps throughput.
-
-### VPP TLS with Async Crypto
-Source: FOSDEM 2025 - VPP TLS Plugin: Enhancing Performance with Asynchronous Operations
-
-VPP (Vector Packet Processing) TLS plugin can offload crypto to hardware using OpenSSL async jobs and DPDK crypto PMD.
-
-```bash
-# VPP config for async TLS
-tls {
-    async
-    engine openssl
-}
-
-# DPDK crypto device binding
-dpdk-devbind.py -b vfio-pci 0000:06:00.0  # crypto accelerator
-```
-
-Performance comparison (RSA-4K handshakes):
-- Software only: ~6-7 Gbps
-- Hardware accelerated with async: 20% higher throughput, 50% lower CPU
-
-**Key insight:** Async crypto jobs let the CPU continue application work while hardware processes RSA/AES, critical for TLS handshake-heavy workloads.
-
-### Latency Tracing in Virtualized Networks
-Source: FOSDEM 2025 - LF Energy SEAPATH SVTrace: Tools for Latency Analysis
-
-Tools for tracing packet latency through hypervisor to VM:
-
-```bash
-# pwru (Packet, Where Are You) - trace kernel functions per packet
-pwru --filter-dst-port 102 --output-tuple
-
-# bpftrace for latency measurement between kernel functions
-bpftrace -e '
-kprobe:skb_recv_done { @start[arg0] = nsecs; }
-kprobe:consume_skb {
-    $lat = nsecs - @start[arg0];
-    @latency = hist($lat / 1000);  // microseconds
-    delete(@start[arg0]);
-}'
-```
-
-SVTrace wrapper combines bpftrace with real-time visualization:
-```bash
-svtrace --live --interface eth0 --filter "ether proto 0x88ba"
-```
-
-Key optimizations discovered:
-- Isolate KVM vCPUs: `isolcpus=4-7` + `taskset -c 4-7 qemu-system-x86_64`
-- Set vhost thread priority higher than QEMU main thread
-- Result: Reduced latency from 200us to 40us for packet transit
-
-**Key insight:** OVS upcalls to userspace cause latency spikes. For real-time, use kernel datapath or avoid OVS entirely.
-
-### Modern Protocol Adoption (Firefox Telemetry)
-Source: FOSDEM 2026 - Modern Network Protocols: What's Next for Firefox and the Web
-
-Real-world protocol performance from Firefox telemetry:
-
-| Protocol | Time to Request Start (75th percentile, Android) |
-|----------|--------------------------------------------------|
-| HTTP/1.1 | ~320ms |
-| HTTP/2   | ~260ms |
-| HTTP/3   | ~130ms |
-
-DNS over HTTPS (DoH) optimization:
-- Long-lived connections to DoH server are critical
-- Server-side: Set `TCP_NODELAY` on DoH endpoints
-- With QUIC 0-RTT, DoH latency matches legacy UDP DNS
-
-Current adoption (Firefox):
-- HTTPS: 98% of traffic
-- HTTP/3: 20-30% of connections
-- ECH (Encrypted Client Hello): 0.3% (low server support)
-- DoH: 12% of DNS queries
-
-**Key insight:** QUIC 0-RTT resumption eliminates handshake overhead, making encrypted DNS viable without latency penalty.
-
-### Passive Traffic Fingerprinting
-Source: FOSDEM 2025 - Passive Network Traffic Fingerprinting
-
-nDPI library fingerprints OS/application from packet metadata without payload inspection.
-
-```bash
-# TCP fingerprint components
-# TTL range + Window size + TCP options + MSS
-# Example: Windows lacks TCP timestamps, Apple devices have distinct option ordering
-
-# View JA4 TLS fingerprint in Wireshark
-wireshark -Y "tls.handshake.type == 1" -T fields -e ja4.hash
-```
-
-TCP fingerprint detection:
-```bash
-# Detect high-speed scanners (masscan, zmap) - no TCP options
-tcpdump -n 'tcp[tcpflags] == tcp-syn and tcp[20:4] == 0'
-```
-
-JA4 TLS fingerprint (replaces JA3):
-- Sorts cipher suites/extensions to counter randomization (GREASE)
-- Format: `protocol_version + cipher_count + extension_count + sorted_ciphers_hash + sorted_extensions_hash`
-
-**Key insight:** Encrypted traffic still leaks client identity through TLS ClientHello structure, TCP options, and connection patterns.
-
-### Link Aggregation balance-slb Mode
-Source: FOSDEM 2025 - Performing Link Aggregation balance-slb in Kernelspace with NetworkManager
-
-Linux kernel now supports OVS-style balance-slb (source load balancing) without switch cooperation.
-
-```bash
-# New kernel transmit hash policy (kernel 6.x+)
-nmcli connection add type bond con-name bond0 ifname bond0 \
-    bond.options "mode=balance-xor,xmit_hash_policy=vlan+srcmac"
-
-# Enable balance-slb in NetworkManager
-nmcli connection modify bond0 bond.options \
-    "mode=balance-xor,xmit_hash_policy=vlan+srcmac,balance-slb=1"
-```
-
-nftables rules to prevent duplicate broadcast/multicast packets:
-```bash
-nft add table netdev bond_slb
-nft add set netdev bond_slb seen { type ether_addr . vlan_id \; flags dynamic,timeout \; timeout 30s \; }
-nft add chain netdev bond_slb ingress { type filter hook ingress device bond0 priority 0 \; }
-nft add rule netdev bond_slb ingress ether type vlan vlan id . ether saddr @seen drop
-nft add rule netdev bond_slb ingress ether type vlan vlan id . ether saddr update @seen
-```
-
-nftables 1.0.6+ added `destroy` command for idempotent cleanup:
-```bash
-nft destroy table netdev bond_slb  # No error if missing
-```
-
-**Key insight:** balance-slb enables multi-path without LACP, but requires nftables rules to deduplicate broadcast traffic arriving on multiple ports.
-
-### Real-Time Video over 5G (RTCP Feedback)
-Source: FOSDEM 2025 - RTCP, Racecars, Video and 5G
-
-RTCP feedback mechanisms for adaptive bitrate over unstable networks:
-
-| Feedback Type | Purpose | Latency Impact |
-|--------------|---------|----------------|
-| REMB (Receiver Estimated Max Bitrate) | Bandwidth estimation from inter-packet arrival | Proactive |
-| NACK | Request retransmission of lost packets | 1-2 frames |
-| PLI (Picture Loss Indication) | Request full keyframe (10x size) | 100-500ms |
-
-REMB bandwidth estimation:
-```
-# Detects buffer buildup before packet loss
-# If inter-packet arrival time grows -> network congestion imminent
-# Reduce bitrate proactively
-```
-
-Test results (race car at 160 kph, 12 cell handovers per lap):
-- Without RTCP adaptation: Frame rate drops to 0 frequently
-- With RTCP REMB + NACK: Constant frame rate, 50x reduction in frozen frames
-
-L4S (Low Latency Low Loss Scalable throughput):
-- RFC 8888 adds RTCP feedback for ECN congestion bits
-- Network equipment marks packets approaching queue limits
-- Enables earlier congestion detection than packet loss
-
-**Key insight:** Varying bitrate based on RTCP feedback maintains constant frame rate over unstable 5G; fixed bitrate causes frequent freezes.
