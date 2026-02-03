@@ -331,3 +331,172 @@ Features:
 | CPU profile | `./asprof -d 60 -f cpu.html PID` |
 | Native memory | `jcmd PID VM.native_memory summary` |
 | Trigger GC | `jcmd PID GC.run` |
+
+## FOSDEM Insights
+
+### jlink Without jmods (JEP 493)
+Source: FOSDEM 2025 - Reduce the Size of Your Java Runtime Image
+
+JDK 24 enables running jlink without the jmods folder via JEP 493. This reduces JDK archive size by ~35% and extracted size by ~15%. Custom runtimes can now be created from any JDK that has this enabled.
+
+```bash
+# Check if linking from runtime image is enabled
+java -XshowSettings 2>&1 | grep "Linking from runtime image"
+
+# Create custom runtime with only needed modules
+jlink --add-modules java.logging,java.naming,jdk.unsupported,jdk.jfr,jdk.jdwp.agent \
+      --output runtime-for-app
+
+# Verify modules in custom runtime
+./runtime-for-app/bin/java --list-modules
+```
+
+**Key insight:** Custom runtimes can reduce bundle size by 50% compared to shipping a full JDK/JRE - the `lib/modules` file shrinks from ~104MB to ~33MB when including only required modules.
+
+### Class Metadata & CLUT Optimization
+Source: FOSDEM 2025 - Quo Vadis Class Space (HotSpot JVM)
+
+Project Lilliput shrinks narrow class ID to 22 bits (from 32), requiring 1KB alignment for class structures. This causes cache hyper-aliasing - different classes collide in L1 cache. The CLUT (Class Look-Up Table) solution pre-computes iteration metadata into 4-byte tokens.
+
+```bash
+# Current class limits by narrow class ID size:
+# Stock JVM (32-bit):  ~5-6 million classes
+# Lilliput (22-bit):   ~4 million classes
+# Hypothetical 19-bit: ~525K classes
+
+# Monitor class metadata with Native Memory Tracking
+jcmd PID VM.native_memory summary | grep -A5 "Class"
+```
+
+**Key insight:** 96-99% of objects in typical heaps have instance sizes <512 bytes and <3 oop map entries - the CLUT token optimization covers these cases without additional memory loads during GC iteration.
+
+### Foreign Function & Memory API (Panama)
+Source: FOSDEM 2025 - Inner Workings of the FFI API in the JVM
+
+The FFI API generates platform-specific code for native calls. Critical functions (no thread state transitions) provide lowest latency but block GC.
+
+```java
+// Standard downcall - includes thread state transition + memory barrier
+var handle = linker.downcallHandle(funcAddr, FunctionDescriptor.of(JAVA_LONG, ADDRESS, JAVA_INT));
+
+// Critical downcall - no state transition, faster but blocks GC
+var criticalHandle = linker.downcallHandle(funcAddr, descriptor,
+    Linker.Option.critical(true));  // true = allow heap access
+
+// Capture errno after native call
+var captureHandle = linker.downcallHandle(funcAddr, descriptor,
+    Linker.Option.captureCallState("errno"));
+```
+
+```bash
+# Debug FFI code generation (debug build required)
+java -Xlog:foreign+downcall=debug ...
+
+# Dump generated binding bytecode
+-Djdk.internal.foreign.SPEC_DUMP=true
+```
+
+**Key insight:** The lock-add instruction (memory barrier) on x86 after native calls is the main FFI overhead - use `Linker.Option.critical()` for high-frequency calls to functions that never block.
+
+### Swift-Java Interop via FFM
+Source: FOSDEM 2025 - Foreign Function and Memory APIs and Swift-Java Interoperability
+
+Swift's value types require special handling - size determined at runtime via type metadata. The `jextract-swift` tool generates Java wrappers that handle Swift calling conventions.
+
+```java
+// Swift type metadata provides runtime layout info
+// Value Witness Table contains: size, stride, alignment, destroy/copy functions
+MemoryLayout swiftLayout = SwiftRuntime.getLayout(swiftTypeMetadata);
+
+// Swift arena manages reference counting for Swift objects
+try (var arena = SwiftArena.ofConfined()) {
+    var swiftStruct = MySwiftStruct.init(arena, length, capacity);
+    // Arena calls destroy on all registered Swift values at close
+}
+```
+
+**Key insight:** Swift value types can be stack-allocated but require calling into Swift runtime for size/layout - type metadata is immortal and can be cached on Java side.
+
+### GC-Friendly Coding Patterns
+Source: FOSDEM 2025 - Go-ing Easy on Memory (applicable to JVM)
+
+Real-world data shows 25-50% CPU time spent on GC in high-throughput systems. Core patterns apply across GC'd languages.
+
+```java
+// AVOID: Returning new allocations escapes to heap
+byte[] process() { return new byte[1024]; }
+
+// PREFER: Accept pre-allocated buffer (may stay on stack in caller)
+void process(byte[] buffer) { /* fill buffer */ }
+
+// AVOID: Boxed types in hot paths
+Map<Long, Boolean> flags;  // Each entry = object allocations
+
+// PREFER: Primitive collections or packed representations
+long[] flagBits;  // Bitset pattern
+
+// AVOID: Hidden allocations
+time.format(...)  // Creates intermediate strings
+String.format(...)
+
+// PREFER: Pre-sized collections
+new ArrayList<>(expectedSize);
+new HashMap<>(expectedSize, 1.0f);
+```
+
+```bash
+# Go-specific but concept applies: stack vs heap escape analysis
+# Java equivalent: JIT inlining decisions visible in compilation logs
+-XX:+PrintCompilation -XX:+PrintInlining
+```
+
+**Key insight:** Copying 64 bytes costs roughly the same as dereferencing a pointer due to cache line granularity - prefer value semantics over pointer indirection when objects are small.
+
+### Struct-of-Arrays for Memory Efficiency
+Source: FOSDEM 2025 - How to Lose Weight: Optimising Memory Usage in JavaScript and Beyond
+
+Data-oriented design reduces per-object overhead. JavaScript objects have 24+ byte headers; similar overhead exists in JVM with object headers (12-16 bytes compressed oops).
+
+```java
+// AVOID: Array of objects (N * (header + fields + padding))
+record Component(int type, boolean enabled, int parent, int[] children) {}
+Component[] components;  // Each Component has object header overhead
+
+// PREFER: Struct of arrays (single header per array, packed data)
+class ComponentTable {
+    byte[] types;           // 1 byte per component vs 4 for int field
+    BitSet enabled;         // 1 bit per component vs 1+ bytes for boolean
+    short[] parents;        // Use smallest sufficient type
+    // Children stored separately if sparse
+    Map<Integer, short[]> childrenByIndex;
+}
+```
+
+**Key insight:** A boolean in an object costs 4-8 bytes (alignment) but only 1 bit of information - struct-of-arrays with BitSet achieves 64x better density for boolean flags.
+
+### sync.Pool Pattern (Go) / Object Pooling
+Source: FOSDEM 2025 - Go-ing Easy on Memory
+
+Object pools reduce allocation pressure between GC cycles. Key gotcha: pool.Get() returns interface{} - avoid boxing primitives.
+
+```java
+// Java equivalent pattern using ThreadLocal or custom pools
+private static final ThreadLocal<byte[]> BUFFER_POOL =
+    ThreadLocal.withInitial(() -> new byte[8192]);
+
+void process() {
+    byte[] buf = BUFFER_POOL.get();
+    try {
+        // use buffer
+    } finally {
+        Arrays.fill(buf, (byte) 0);  // Reset for reuse
+    }
+}
+
+// For object pools, consider:
+// - Caffeine cache with size=0, expireAfterAccess (soft references)
+// - Apache Commons Pool2
+// - Custom ring buffer for fixed-size allocations
+```
+
+**Key insight:** Pool effectiveness depends on allocation frequency vs GC frequency - objects must be reused within 2 GC cycles in Go's sync.Pool; Java pools with soft references survive longer but add lookup overhead.

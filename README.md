@@ -16,6 +16,7 @@ Linux performance, debugging, and system administration toolkit.
 | [Kernel Tuning](08-kernel-tuning.md) | sysctl, CPU, memory, I/O tuning |
 | [Network Tuning](09-network-tuning.md) | TCP, congestion control, NUMA |
 | [Java/JVM](10-java-jvm.md) | JVM profiling and tuning |
+| [GPU & HPC](11-gpu-hpc.md) | GPU profiling, MIG, HPC tracing |
 
 ## 60-Second Analysis
 
