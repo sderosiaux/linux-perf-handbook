@@ -1,6 +1,6 @@
-# Curated System Tools
+# Linux Perf Handbook
 
-Linux performance, debugging, and system administration toolkit.
+Performance engineering, debugging, and system tuning reference.
 
 ## Quick Navigation
 
