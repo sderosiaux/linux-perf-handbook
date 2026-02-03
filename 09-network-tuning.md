@@ -571,6 +571,304 @@ net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.ip_local_port_range = 1024 65535
 ```
 
+## Kernel Bypass Technologies
+
+When the standard Linux network stack becomes the bottleneck.
+
+### Overview
+
+```
+Traditional Stack:        XDP:                    AF_XDP:                 DPDK:
+┌─────────────────┐      ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
+│   Application   │      │   Application   │     │   Application   │     │   Application   │
+├─────────────────┤      ├─────────────────┤     ├─────────────────┤     ├─────────────────┤
+│    Socket API   │      │    Socket API   │     │   AF_XDP Socket │     │    DPDK PMD     │
+├─────────────────┤      ├─────────────────┤     │   (zero-copy)   │     │   (poll mode)   │
+│   TCP/IP Stack  │      │   TCP/IP Stack  │     ├─────────────────┤     ├─────────────────┤
+├─────────────────┤      ├─────────────────┤     │   XDP Program   │     │                 │
+│     Driver      │      │  XDP │ Driver   │     ├─────────────────┤     │    Userspace    │
+├─────────────────┤      ├─────────────────┤     │     Driver      │     │     Driver      │
+│       NIC       │      │       NIC       │     ├─────────────────┤     ├─────────────────┤
+└─────────────────┘      └─────────────────┘     │       NIC       │     │       NIC       │
+                                                 └─────────────────┘     └─────────────────┘
+  ~1M pps/core           ~5-10M pps/core         ~20-40M pps/core        ~40-70M pps/core
+```
+
+### XDP (eXpress Data Path)
+
+In-kernel fast path for packet processing. Processes packets at driver level before sk_buff allocation.
+
+**Modes:**
+
+| Mode | Location | Performance | Requirements |
+|------|----------|-------------|--------------|
+| Generic | After sk_buff | Lowest | Any NIC |
+| Native | Driver hook | High | Driver support |
+| Offload | NIC hardware | Highest | SmartNIC (Netronome) |
+
+**Use cases:**
+- DDoS mitigation (drop malicious packets early)
+- Load balancing (redirect to backends)
+- Packet filtering (firewall acceleration)
+- Traffic sampling
+
+**Quick start:**
+```bash
+# Attach XDP program
+ip link set dev eth0 xdp obj xdp_prog.o sec xdp
+
+# Check XDP status
+ip link show eth0 | grep xdp
+
+# Remove XDP program
+ip link set dev eth0 xdp off
+
+# Native vs generic mode
+ip link set dev eth0 xdpgeneric obj xdp_prog.o  # Generic (slower)
+ip link set dev eth0 xdpdrv obj xdp_prog.o      # Native (faster)
+```
+
+**Simple drop program:**
+```c
+SEC("xdp")
+int xdp_drop_all(struct xdp_md *ctx) {
+    return XDP_DROP;  // Drop all packets
+}
+
+// Return values:
+// XDP_DROP    - Drop packet
+// XDP_PASS    - Pass to normal stack
+// XDP_TX      - Bounce back out same interface
+// XDP_REDIRECT - Send to another interface/CPU
+// XDP_ABORTED - Error, drop + trace
+```
+
+**Driver support check:**
+```bash
+# Check if NIC supports native XDP
+ethtool -i eth0 | grep driver
+# Common drivers with XDP: i40e, ice, ixgbe, mlx5, virtio_net, veth
+
+# Verify XDP program loaded in native mode
+bpftool net show dev eth0
+```
+
+**Performance:** 5-10M pps/core in native mode, limited by BPF program complexity.
+
+### AF_XDP (Zero-Copy Sockets)
+
+Kernel-supported fast path to userspace. Combines XDP filtering with zero-copy delivery to application.
+
+**How it works:**
+1. XDP program filters packets, redirects selected ones to AF_XDP socket
+2. Packets placed in shared UMEM (user-mapped memory)
+3. Application reads directly from ring buffers - no copies
+
+**Architecture:**
+```
+                     ┌─────────────────┐
+                     │   Application   │
+                     │  (poll rings)   │
+                     └────────┬────────┘
+                              │ mmap
+              ┌───────────────┴───────────────┐
+              │            UMEM               │
+              │  ┌──────┐ ┌──────┐ ┌──────┐  │
+              │  │ Fill │ │Compl.│ │ RX   │  │
+              │  │ Ring │ │ Ring │ │ Ring │  │
+              │  └──────┘ └──────┘ └──────┘  │
+              └───────────────┬───────────────┘
+                              │
+              ┌───────────────┴───────────────┐
+              │         XDP Program           │
+              │   (bpf_redirect_map to xsk)   │
+              └───────────────┬───────────────┘
+                              │
+              ┌───────────────┴───────────────┐
+              │            Driver             │
+              └───────────────────────────────┘
+```
+
+**Setup:**
+```bash
+# Requirements
+# - Kernel 4.18+ (basic), 5.4+ (recommended)
+# - Driver with AF_XDP support
+# - libxdp >= 1.2.2, libbpf
+
+# Check AF_XDP support
+grep -r XDP /proc/config.gz  # CONFIG_XDP_SOCKETS=y
+
+# Load XDP program that redirects to AF_XDP socket
+# (typically done in application using libxdp)
+```
+
+**Performance:**
+- Copy mode: ~15-20M pps/core
+- Zero-copy mode: ~30-40M pps/core
+- With DPDK AF_XDP PMD: ~20-35M pps/core
+
+**Key insight:** AF_XDP keeps Linux networking tools working (ip, tcpdump on other traffic) while providing near-DPDK speeds for targeted flows.
+
+### DPDK (Data Plane Development Kit)
+
+Full userspace networking. Kernel completely bypassed.
+
+**When DPDK:**
+- Need absolute maximum performance (line rate at 100Gbps+)
+- Dedicated NIC for application (no sharing with kernel)
+- Can handle all protocol processing in userspace
+- Have team expertise for DPDK development
+
+**When NOT DPDK:**
+- Need standard Linux tools (ip, iptables, tcpdump)
+- Mixed traffic (some kernel, some fast-path)
+- Don't want to maintain separate network stack
+- Development velocity matters more than last 10% performance
+
+**Setup complexity:**
+```bash
+# 1. Bind NIC to DPDK-compatible driver
+modprobe vfio-pci
+dpdk-devbind.py --status
+dpdk-devbind.py -b vfio-pci 0000:03:00.0
+
+# 2. Allocate hugepages (required for DPDK)
+echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+mkdir -p /mnt/huge
+mount -t hugetlbfs nodev /mnt/huge
+
+# 3. NIC is now invisible to kernel
+ip link show  # eth0 gone
+```
+
+**DPDK vs AF_XDP poll mode driver:**
+```bash
+# DPDK can use AF_XDP as backend (hybrid approach)
+# Simpler setup, kernel still sees NIC
+dpdk-testpmd -l 0-3 -n 4 \
+    --vdev="net_af_xdp0,iface=eth0,start_queue=0,queue_count=1" \
+    -- -i
+
+# Pure DPDK (full bypass)
+dpdk-testpmd -l 0-3 -n 4 -a 0000:03:00.0 -- -i
+```
+
+**Performance:** 40-70M pps/core, line rate at 100Gbps with proper NICs.
+
+### Decision Tree
+
+```
+START: Is kernel networking your bottleneck?
+│
+├─> No: Packet rate < 1M pps/core
+│   └─> Use standard stack with tuning (buffers, RSS, busy polling)
+│
+├─> Yes: Need > 1M pps/core
+│   │
+│   ├─> Only need filtering/redirect (no userspace processing)?
+│   │   └─> Use XDP native mode
+│   │       - DDoS mitigation, load balancing, firewall
+│   │       - 5-10M pps/core
+│   │
+│   ├─> Need userspace processing but also standard tools?
+│   │   └─> Use AF_XDP
+│   │       - Selected flows fast-pathed, rest through kernel
+│   │       - 20-40M pps/core
+│   │
+│   └─> Need maximum performance, dedicated NIC acceptable?
+│       └─> Use DPDK
+│           - 40-70M pps/core, line rate at 100Gbps
+│           - No kernel networking on that NIC
+```
+
+### Performance Comparison
+
+| Technology | Packets/sec (64B) | Latency | Kernel Tools | Setup Complexity |
+|------------|-------------------|---------|--------------|------------------|
+| Kernel stack | 0.5-1M pps/core | ~50us | Full | Low |
+| XDP (generic) | 1-2M pps/core | ~30us | Full | Low |
+| XDP (native) | 5-10M pps/core | ~5us | Full | Medium |
+| AF_XDP (copy) | 15-20M pps/core | ~3us | Partial | Medium |
+| AF_XDP (zero-copy) | 30-40M pps/core | ~2us | Partial | High |
+| DPDK | 40-70M pps/core | <1us | None | High |
+
+### Setup Complexity Comparison
+
+| Technology | Kernel Version | Driver Changes | Hugepages | Application Changes |
+|------------|---------------|----------------|-----------|---------------------|
+| XDP | 4.8+ | None (generic) | No | BPF program |
+| XDP native | 4.8+ | Need driver support | No | BPF program |
+| AF_XDP | 4.18+ | Need driver support | No | Ring buffer polling |
+| DPDK | Any | Bind to DPDK driver | Yes | Full rewrite |
+
+### Hybrid Approaches
+
+**XDP + normal stack:**
+```c
+// Filter at XDP level, pass interesting traffic up
+SEC("xdp")
+int xdp_filter(struct xdp_md *ctx) {
+    // Parse headers...
+    if (is_attack_traffic())
+        return XDP_DROP;
+    if (needs_fast_path())
+        return bpf_redirect_map(&xsks_map, index, 0);
+    return XDP_PASS;  // Regular stack for everything else
+}
+```
+
+**AF_XDP with kernel fallback:**
+```bash
+# Bind AF_XDP to specific queue
+# Other queues handled by kernel normally
+ethtool -L eth0 combined 4
+# Queue 0 -> AF_XDP
+# Queues 1-3 -> kernel stack
+```
+
+**DPDK AF_XDP PMD:**
+```bash
+# DPDK application using kernel driver via AF_XDP
+# NIC stays visible to kernel, DPDK gets fast path
+# Best of both worlds, some performance cost
+```
+
+### Troubleshooting
+
+```bash
+# XDP program not loading?
+ip link set dev eth0 xdpgeneric obj prog.o  # Try generic first
+dmesg | grep -i xdp
+
+# AF_XDP zero-copy not working?
+# Check driver support
+ethtool -i eth0
+# Enable zero-copy explicitly in application
+
+# DPDK not seeing NIC?
+dpdk-devbind.py --status
+# Check IOMMU enabled for vfio-pci
+dmesg | grep -i iommu
+
+# Performance lower than expected?
+# Check mode (native vs generic for XDP)
+bpftool net show
+# Check zero-copy mode for AF_XDP
+# Check hugepage allocation for DPDK
+cat /proc/meminfo | grep Huge
+```
+
+### Production Recommendations
+
+1. **Start with XDP** - Test if in-kernel processing is sufficient
+2. **Graduate to AF_XDP** - When userspace processing needed
+3. **DPDK as last resort** - Only for maximum performance requirements
+4. **Always benchmark** - Real workloads, not synthetic tests
+5. **Monitor bypass paths** - Lost visibility requires explicit instrumentation
+
+**Key insight:** XDP/AF_XDP provide 80% of DPDK performance with 20% of the complexity. Most applications don't need full bypass.
+
 ## io_uring for Networking (5.19+)
 
 io_uring provides significant performance improvements for network I/O, with major enhancements in 6.x kernels.

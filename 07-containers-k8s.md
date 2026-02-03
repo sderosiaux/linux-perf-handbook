@@ -631,6 +631,283 @@ systemd-cgtop -c               # Sort by CPU
 systemd-cgtop -d 1             # 1 second delay
 ```
 
+## cgroup v2 Metrics Interpretation
+
+Deep dive into cgroup v2 stat files for container resource diagnosis.
+
+### cpu.stat Fields
+
+```bash
+cat /sys/fs/cgroup/<path>/cpu.stat
+# Example output:
+# usage_usec 104036485036
+# user_usec 98419994704
+# system_usec 5616490332
+# nr_periods 164357
+# nr_throttled 143842
+# throttled_usec 9516539086
+```
+
+| Field | Description | Red Flag |
+|-------|-------------|----------|
+| `usage_usec` | Total CPU time consumed (all cores) | - |
+| `user_usec` | Time in user mode | - |
+| `system_usec` | Time in kernel mode | High = excessive syscalls |
+| `nr_periods` | Number of CFS scheduler periods | - |
+| `nr_throttled` | Times cgroup hit CPU limit | > 0 = throttling occurring |
+| `throttled_usec` | Total time throttled | Growing = latency source |
+
+**Throttling detection:**
+```bash
+# Check if container is being throttled
+CGROUP_PATH="/sys/fs/cgroup/system.slice/docker-${CONTAINER_ID}.scope"
+
+# Get current throttling stats
+cat $CGROUP_PATH/cpu.stat | grep throttled
+
+# Calculate throttle percentage
+nr_periods=$(awk '/nr_periods/ {print $2}' $CGROUP_PATH/cpu.stat)
+nr_throttled=$(awk '/nr_throttled/ {print $2}' $CGROUP_PATH/cpu.stat)
+if [ "$nr_periods" -gt 0 ]; then
+    throttle_pct=$((nr_throttled * 100 / nr_periods))
+    echo "Throttle rate: ${throttle_pct}%"
+fi
+
+# Threshold: >5% throttle rate typically indicates CPU limit too low
+```
+
+**Key insight:** `nr_throttled > 0` means container hit its CPU limit. Even small throttle rates (1-5%) can cause latency spikes in latency-sensitive workloads.
+
+### memory.stat Fields
+
+```bash
+cat /sys/fs/cgroup/<path>/memory.stat
+# Key fields:
+# anon 8392704000
+# file 2147483648
+# shmem 0
+# kernel_stack 1048576
+# slab 134217728
+# sock 0
+# pgfault 12345678
+# pgmajfault 1234
+```
+
+| Field | Description | Red Flag |
+|-------|-------------|----------|
+| `anon` | Anonymous memory (heap, stack, mmap) | Growing unbounded = leak |
+| `file` | Page cache for files | Normal, reclaimable |
+| `shmem` | Shared memory (tmpfs, shared maps) | - |
+| `kernel_stack` | Kernel stack usage | High = many threads |
+| `slab` | Kernel slab allocations | Growing = kernel memory leak |
+| `sock` | Socket buffer memory | High = many connections |
+| `pgfault` | Page faults (minor) | High = memory churn |
+| `pgmajfault` | Major page faults (disk I/O) | Any = OOM risk, thrashing |
+
+**Memory usage breakdown:**
+```bash
+CGROUP_PATH="/sys/fs/cgroup/system.slice/docker-${CONTAINER_ID}.scope"
+
+# Current memory usage
+current=$(cat $CGROUP_PATH/memory.current)
+max=$(cat $CGROUP_PATH/memory.max)
+high=$(cat $CGROUP_PATH/memory.high 2>/dev/null || echo "max")
+
+echo "Current: $((current / 1048576)) MB"
+echo "High (throttle): $high"
+echo "Max (OOM): $((max / 1048576)) MB"
+
+# Usage percentage
+if [ "$max" != "max" ]; then
+    pct=$((current * 100 / max))
+    echo "Usage: ${pct}%"
+    # Red flag: >90% = OOM risk
+fi
+
+# Check for memory pressure
+cat $CGROUP_PATH/memory.stat | grep -E '^(anon|file|slab|pgmajfault)'
+```
+
+### memory.high vs memory.max Behavior
+
+```
+                    memory.high              memory.max
+                         │                        │
+    ┌────────────────────┼────────────────────────┼─────────┐
+    │    Normal          │   Throttled +          │   OOM   │
+    │    Operation       │   Reclaim Pressure     │   Kill  │
+    └────────────────────┴────────────────────────┴─────────┘
+```
+
+| Limit | Behavior When Exceeded | Kills Process? |
+|-------|------------------------|----------------|
+| `memory.high` | Throttles, heavy reclaim pressure | Never |
+| `memory.max` | OOM killer invoked | Yes |
+
+**memory.high:**
+- Soft limit for throttling
+- Container slows down but doesn't die
+- Can be temporarily breached under extreme conditions
+- Use for graceful degradation
+
+**memory.max:**
+- Hard limit, cannot be exceeded
+- OOM killer terminates processes when hit
+- Use as safety net
+
+```bash
+# Set memory limits (example)
+echo 1073741824 > $CGROUP_PATH/memory.max   # 1GB hard limit
+echo 858993459 > $CGROUP_PATH/memory.high   # 800MB soft limit (~80%)
+
+# Kubernetes sets memory.max from limits, memory.high from requests (with MemoryQoS)
+```
+
+**Key insight:** If your container is slow but not crashing, check `memory.events` for `high` counter - it indicates throttling at memory.high, which is often invisible without explicit monitoring.
+
+### io.stat Fields
+
+```bash
+cat /sys/fs/cgroup/<path>/io.stat
+# Format: MAJ:MIN rbytes=X wbytes=Y rios=Z wios=W dbytes=A dios=B
+# Example:
+# 8:0 rbytes=1234567890 wbytes=9876543210 rios=12345 wios=54321 dbytes=0 dios=0
+```
+
+| Field | Description | Red Flag |
+|-------|-------------|----------|
+| `rbytes` | Bytes read from device | - |
+| `wbytes` | Bytes written to device | - |
+| `rios` | Read I/O operations | High with low rbytes = small random reads |
+| `wios` | Write I/O operations | High with low wbytes = small random writes |
+| `dbytes` | Discarded bytes (TRIM) | - |
+| `dios` | Discard operations | - |
+
+**I/O analysis:**
+```bash
+CGROUP_PATH="/sys/fs/cgroup/system.slice/docker-${CONTAINER_ID}.scope"
+
+# Parse io.stat
+cat $CGROUP_PATH/io.stat | while read line; do
+    dev=$(echo $line | cut -d' ' -f1)
+    rbytes=$(echo $line | grep -oP 'rbytes=\K[0-9]+')
+    wbytes=$(echo $line | grep -oP 'wbytes=\K[0-9]+')
+    rios=$(echo $line | grep -oP 'rios=\K[0-9]+')
+    wios=$(echo $line | grep -oP 'wios=\K[0-9]+')
+
+    echo "Device $dev:"
+    echo "  Read:  $((rbytes / 1048576)) MB in $rios ops"
+    echo "  Write: $((wbytes / 1048576)) MB in $wios ops"
+
+    # Calculate average I/O size
+    if [ "$rios" -gt 0 ]; then
+        avg_read=$((rbytes / rios))
+        echo "  Avg read size: $avg_read bytes"
+        # Red flag: avg < 4096 = inefficient small I/O
+    fi
+done
+```
+
+### PSI (Pressure Stall Information) per-cgroup
+
+PSI provides real-time pressure metrics for CPU, memory, and I/O at the cgroup level.
+
+```bash
+# Available files (cgroup v2 with CONFIG_PSI=y)
+cat /sys/fs/cgroup/<path>/cpu.pressure
+cat /sys/fs/cgroup/<path>/memory.pressure
+cat /sys/fs/cgroup/<path>/io.pressure
+
+# Example output:
+# some avg10=0.00 avg60=0.00 avg300=0.00 total=123456
+# full avg10=0.00 avg60=0.00 avg300=0.00 total=12345
+```
+
+| Metric | Meaning | Threshold |
+|--------|---------|-----------|
+| `some` | % time *some* tasks stalled | >10% = contention |
+| `full` | % time *all* tasks stalled | >5% = severe bottleneck |
+| `avg10` | 10-second moving average | Most responsive |
+| `avg60` | 1-minute moving average | Good for alerting |
+| `avg300` | 5-minute moving average | Trend analysis |
+| `total` | Accumulated microseconds | Historical tracking |
+
+**PSI monitoring script:**
+```bash
+#!/bin/bash
+CGROUP_PATH="/sys/fs/cgroup/system.slice/docker-${CONTAINER_ID}.scope"
+
+echo "=== Container Pressure Analysis ==="
+
+for resource in cpu memory io; do
+    file="$CGROUP_PATH/${resource}.pressure"
+    if [ -f "$file" ]; then
+        echo ""
+        echo "[$resource]"
+        while read line; do
+            type=$(echo $line | cut -d' ' -f1)
+            avg10=$(echo $line | grep -oP 'avg10=\K[0-9.]+')
+            avg60=$(echo $line | grep -oP 'avg60=\K[0-9.]+')
+
+            printf "  %-5s avg10=%6.2f%% avg60=%6.2f%%" "$type" "$avg10" "$avg60"
+
+            # Flag concerning values
+            if (( $(echo "$avg10 > 10" | bc -l) )); then
+                printf " [WARNING: HIGH PRESSURE]"
+            fi
+            echo ""
+        done < "$file"
+    fi
+done
+```
+
+**Red flags by resource:**
+
+| Resource | some > 10% | full > 5% |
+|----------|-----------|-----------|
+| CPU | Tasks waiting for CPU | All tasks CPU-starved |
+| Memory | Reclaim activity | Severe thrashing |
+| I/O | Waiting for disk | Disk completely saturated |
+
+**Key insight:** PSI `full` metric is critical - it means ALL tasks in the cgroup are blocked, indicating a complete stall. Facebook's oomd uses PSI triggers to preemptively kill containers before OOM.
+
+### Container Diagnostics Command Reference
+
+```bash
+# Full container health check
+CONTAINER_ID="abc123"
+CGROUP_PATH="/sys/fs/cgroup/system.slice/docker-${CONTAINER_ID}.scope"
+
+echo "=== CPU ==="
+cat $CGROUP_PATH/cpu.stat
+cat $CGROUP_PATH/cpu.pressure
+
+echo "=== Memory ==="
+echo "Current: $(cat $CGROUP_PATH/memory.current)"
+echo "Max: $(cat $CGROUP_PATH/memory.max)"
+cat $CGROUP_PATH/memory.stat | head -20
+cat $CGROUP_PATH/memory.pressure
+cat $CGROUP_PATH/memory.events
+
+echo "=== I/O ==="
+cat $CGROUP_PATH/io.stat
+cat $CGROUP_PATH/io.pressure
+
+# Kubernetes: get cgroup path from pod
+kubectl get pod POD -o jsonpath='{.status.containerStatuses[0].containerID}' | cut -d/ -f3
+# Then find under /sys/fs/cgroup/kubepods.slice/
+```
+
+**Quick diagnostic decisions:**
+
+| Symptom | Check | Fix |
+|---------|-------|-----|
+| Slow but not crashing | `memory.pressure`, `memory.events` (high count) | Increase memory.high or request |
+| Latency spikes | `cpu.stat` nr_throttled | Increase CPU limit or remove limit |
+| OOM kills | `memory.events` (oom_kill count) | Increase memory.max |
+| Slow I/O | `io.pressure` full > 0 | Check disk, add I/O limits |
+| Everything slow | All PSI some > 20% | Node overcommitted, scale out |
+
 ## JVM in Containers
 
 JVM defaults to 25% of container memory for heap (conservative for non-container contexts). Red Hat builds default to 80%.

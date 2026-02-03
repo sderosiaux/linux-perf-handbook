@@ -148,6 +148,186 @@ option("interval", int, 10);
 interval:s:$interval { print(@stats); }
 ```
 
+## Tracepoint vs Kprobe vs Fentry
+
+Decision framework for choosing the right eBPF attach point.
+
+### Stability Comparison
+
+| Attach Type | ABI Stability | Breakage Risk | Best For |
+|-------------|--------------|---------------|----------|
+| Tracepoints | Stable kernel ABI | Low - maintained across versions | Production monitoring |
+| Raw tracepoints | Stable ABI | Low | Performance-critical tracing |
+| Kprobes | Unstable - internal API | High - functions renamed/removed | Development, debugging |
+| Fentry/Fexit | Unstable - internal API | High - same as kprobes | Performance-sensitive tracing |
+
+**Key insight:** Tracepoints are explicit kernel contracts. Kprobes/fentry attach to internal functions that can change between kernel versions, patch levels, or even distribution builds.
+
+### Performance Overhead
+
+**Ranking (fastest to slowest):** Tracepoints > Fentry > Kprobe
+
+```
+Tracepoint:  NOP when disabled, minimal overhead when enabled
+             ~10-50ns per event
+
+Fentry:      BPF trampoline, JIT-compiled jump
+             ~50-100ns per event
+
+Kprobe:      int3 trap instruction -> exception handler -> callback
+             ~100-300ns per event
+```
+
+**Why the difference:**
+- **Kprobes** replace instruction with `int3`, triggering CPU exception on every hit
+- **Fentry** patches function prologue with jump to BPF trampoline - no exception
+- **Tracepoints** are compile-time instrumentation points with optimized calling convention
+
+### Availability Check
+
+```bash
+# List available tracepoints
+bpftrace -l 'tracepoint:*' | wc -l
+cat /sys/kernel/debug/tracing/available_events
+
+# Check if kernel has BTF (required for fentry)
+ls /sys/kernel/btf/vmlinux
+
+# List kernel functions available for kprobe/fentry
+cat /proc/kallsyms | grep ' T '
+
+# Check if function is inlined (can't kprobe inlined functions)
+bpftrace -l 'kprobe:vfs_read'  # Returns result if attachable
+```
+
+### Decision Matrix
+
+```
+START: What do you need to trace?
+│
+├─> Syscall entry/exit?
+│   └─> Use tracepoint:syscalls:sys_enter_* / sys_exit_*
+│
+├─> Scheduler events? (context switch, wakeup)
+│   └─> Use tracepoint:sched:sched_switch, sched_wakeup
+│
+├─> Block I/O?
+│   └─> Use tracepoint:block:block_rq_issue, block_rq_complete
+│
+├─> Network events? (TCP state, socket)
+│   └─> Use tracepoint:sock:*, tracepoint:tcp:*
+│
+├─> Specific kernel function not covered by tracepoints?
+│   │
+│   ├─> Need function arguments AND return value?
+│   │   └─> Use fentry + fexit (kernel 5.5+)
+│   │
+│   ├─> Need to probe mid-function (specific instruction)?
+│   │   └─> Use kprobe with offset
+│   │
+│   ├─> Performance critical (hot path, high frequency)?
+│   │   └─> Use fentry (10x faster than kprobe)
+│   │
+│   └─> Kernel < 5.5 or no BTF?
+│       └─> Use kprobe/kretprobe
+│
+└─> Userspace function?
+    └─> Use uprobe/uretprobe or USDT if available
+```
+
+### Examples
+
+**Tracepoint - Stable, recommended:**
+```bash
+# Trace all file opens (stable API)
+bpftrace -e 'tracepoint:syscalls:sys_enter_openat {
+    printf("%s %s\n", comm, str(args->filename));
+}'
+
+# TCP retransmissions (stable)
+bpftrace -e 'tracepoint:tcp:tcp_retransmit_skb {
+    printf("%s:%d -> %s:%d\n",
+        ntop(args->saddr), args->sport,
+        ntop(args->daddr), args->dport);
+}'
+```
+
+**Fentry - High performance, kernel 5.5+:**
+```bash
+# VFS read latency (faster than kprobe)
+bpftrace -e '
+fentry:vfs_read { @start[tid] = nsecs; }
+fexit:vfs_read /@start[tid]/ {
+    @latency = hist(nsecs - @start[tid]);
+    delete(@start[tid]);
+}'
+
+# Access both args and return value in fexit
+bpftrace -e '
+fexit:tcp_sendmsg {
+    printf("sent %d bytes, ret=%d\n", args->size, retval);
+}'
+```
+
+**Kprobe - Flexible, use when no alternative:**
+```bash
+# Probe mid-function (not possible with fentry)
+bpftrace -e 'kprobe:do_sys_open+0x42 { printf("hit offset\n"); }'
+
+# When function signature unclear or BTF unavailable
+bpftrace -e 'kprobe:tcp_connect {
+    printf("%s connecting\n", comm);
+}'
+```
+
+### Kernel Version Requirements
+
+| Feature | Minimum Kernel | Notes |
+|---------|---------------|-------|
+| Tracepoints | 2.6.32+ | Widely available |
+| Kprobes | 2.6.9+ | Oldest, most compatible |
+| Kretprobes | 2.6.9+ | Return value only |
+| Fentry/Fexit | 5.5+ (x86), 6.0+ (ARM) | Requires BTF |
+| Raw tracepoints | 4.17+ | Slightly faster than tracepoints |
+| BPF trampolines | 5.5+ | Enables fentry performance |
+
+### Verifying Attachability
+
+```bash
+# Check if tracepoint exists
+cat /sys/kernel/debug/tracing/events/syscalls/sys_enter_openat/format
+
+# Check if function is traceable with fentry (needs BTF)
+bpftool btf dump file /sys/kernel/btf/vmlinux | grep -A5 "FUNC 'vfs_read'"
+
+# Test kprobe attachment
+echo 'p:test_probe vfs_read' > /sys/kernel/debug/tracing/kprobe_events
+cat /sys/kernel/debug/tracing/kprobe_events
+echo '-:test_probe' >> /sys/kernel/debug/tracing/kprobe_events
+
+# List functions that changed between kernel versions
+# (useful for kprobe/fentry compatibility checking)
+diff <(grep ' T ' /proc/kallsyms.old) <(grep ' T ' /proc/kallsyms)
+```
+
+### Production Recommendations
+
+1. **Always prefer tracepoints** - Stable ABI, lower overhead, guaranteed availability
+2. **Use fentry for performance** - When tracepoint doesn't exist, fentry is 10x faster than kprobe
+3. **Test kprobes across kernel versions** - Symbol may not exist; check with `bpftrace -l`
+4. **Add fallback logic** - Production tools should try fentry, fall back to kprobe
+5. **Monitor attachment failures** - Log when expected probes fail to attach
+
+```c
+// libbpf pattern: try fentry, fall back to kprobe
+struct bpf_program *prog;
+int err = bpf_program__attach_trace(prog);
+if (err == -EOPNOTSUPP) {
+    // Kernel doesn't support fentry, use kprobe
+    err = bpf_program__attach_kprobe(prog, false, "func_name");
+}
+```
+
 ## BCC Tools
 
 BCC (BPF Compiler Collection) provides ready-to-use eBPF-based tools.
