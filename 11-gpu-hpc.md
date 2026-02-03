@@ -1,89 +1,413 @@
 # GPU & HPC Profiling
 
-GPU performance monitoring, HPC tracing, and accelerator debugging.
+GPU performance monitoring, accelerator optimization, and multi-GPU profiling for NVIDIA and AMD systems.
 
 ---
 
-## GPU Profiling Tools
+## GPU Architecture Primer
 
-### nvidia-smi
+| Vendor | Unit | Description |
+|--------|------|-------------|
+| NVIDIA | SM (Streaming Multiprocessor) | CUDA cores, tensor cores, shared memory |
+| AMD | CU (Compute Unit) | Stream processors, LDS, vector/scalar units |
 
-Basic GPU monitoring utility included with NVIDIA drivers.
+**Key insight:** Utilization measures if SMs/CUs are busy, NOT efficiency. 100% utilization with CUDA cores is far slower than 50% with tensor cores.
 
-```bash
-nvidia-smi                        # Basic overview
-nvidia-smi -l 1                   # Refresh every second
-nvidia-smi -L                     # List GPU UUIDs
-nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv
+### Memory Hierarchy
+
+```
+Registers → Shared Memory/LDS (~100KB) → L2 Cache (~50MB) → HBM (~80GB) → System RAM
 ```
 
-**Limitations:** Shows utilization but not efficiency. 100% utilization does NOT mean 100% efficiency:
-- FP32 workloads may show 100% but use 0% tensor cores
-- FP16 workloads use tensor cores (8-10x faster than CUDA cores)
+### Interconnects
 
-**Key insight:** GPU utilization measures if SMs are doing work, not how much or how efficiently.
+| Type | Bandwidth | Use Case |
+|------|-----------|----------|
+| PCIe 4.0 x16 | 32 GB/s | Consumer, single GPU |
+| PCIe 5.0 x16 | 64 GB/s | Workstations |
+| NVLink 4.0 | 900 GB/s | Multi-GPU training |
+| Infinity Fabric | 896 GB/s | AMD multi-die (MI300X) |
 
-### NVIDIA DCGM (Data Center GPU Manager)
+---
 
-Hardware-level GPU monitoring for data centers.
+## NVIDIA Profiling Stack
+
+### nvidia-smi Deep Dive
 
 ```bash
-# Install and start
+nvidia-smi                              # Overview
+nvidia-smi -l 1                         # Refresh every second
+nvidia-smi -q -d MEMORY                 # Memory details
+nvidia-smi -q -d PERFORMANCE            # Throttle reasons
+nvidia-smi -q -d POWER                  # Power limits
+
+# CSV for scripting
+nvidia-smi --query-gpu=index,name,temperature.gpu,utilization.gpu,\
+memory.used,power.draw --format=csv,noheader,nounits -l 1
+```
+
+**Device monitoring (dmon):**
+
+```bash
+nvidia-smi dmon -s pucmet -d 1          # All metrics, 1s interval
+nvidia-smi dmon -s t                    # PCIe throughput only
+```
+
+| Flag | Metrics |
+|------|---------|
+| p | Power, temperature |
+| u | SM, memory utilization |
+| c | Clocks |
+| m | FB, BAR1 memory |
+| e | ECC errors |
+| t | PCIe throughput |
+
+**Topology and NVLink:**
+
+```bash
+nvidia-smi topo -m                      # GPU topology matrix
+nvidia-smi nvlink -s                    # NVLink status
+nvidia-smi nvlink -g 0                  # GPU 0 NVLink info
+```
+
+### Nsight Systems
+
+System-wide profiler for CPU-GPU interaction.
+
+```bash
+nsys profile -o report ./my_app         # Generate .nsys-rep
+nsys profile --stats=true ./my_app      # With summary stats
+nsys profile -t cuda,nvtx,cudnn ./my_app # Targeted tracing
+nsys profile -o report_%q{OMPI_COMM_WORLD_RANK} mpirun -np 4 ./app  # MPI
+```
+
+**Key analysis patterns:**
+- Kernel launch gaps = CPU bottleneck
+- Memory copy not overlapping compute = poor stream usage
+- Single stream execution = missing parallelism
+
+### Nsight Compute
+
+Kernel-level profiler for CUDA optimization.
+
+```bash
+ncu ./my_app                            # Profile all kernels
+ncu --set full ./my_app                 # All metrics (slow)
+ncu -k "matmul" -c 5 ./my_app           # Specific kernel, 5 invocations
+ncu --launch-skip 100 -c 10 ./my_app    # Skip warmup
+ncu --set full -o roofline ./my_app     # Roofline analysis
+```
+
+**Key metrics:**
+
+| Metric | Target |
+|--------|--------|
+| sm__throughput.avg.pct_of_peak | >80% |
+| sm__inst_executed_pipe_tensor.avg | High for matrix ops |
+
+### DCGM (Data Center GPU Manager)
+
+```bash
 apt install datacenter-gpu-manager
-systemctl start nvidia-dcgm
+systemctl enable --now nvidia-dcgm
 
-# Basic monitoring
-dcgmi discovery -l              # List GPUs
-dcgmi dmon                      # Real-time monitoring
-dcgmi dmon -e 155,156,203,204   # Specific metrics by ID
+dcgmi discovery -l                      # List GPUs
+dcgmi dmon -e 155,156,203               # SM activity, occupancy, tensor
+dcgmi health -c                         # GPU health
+dcgmi diag -r 3                         # Full stress test
 ```
 
-**Key DCGM Metrics:**
+**Key field IDs:**
 
-| Code | Metric | Purpose |
-|------|--------|---------|
-| 155 | SM Activity | Actual compute work happening |
-| 156 | SM Occupancy | SMs with scheduled work |
-| 203 | Tensor Active | Tensor core utilization |
-| 1001 | FP16 Tensor | Half-precision matrix ops |
-| 1002 | FP32 Tensor | Single-precision ops (TF32) |
-| 1003 | FP64 Tensor | Double-precision ops |
-| 1004 | INT8 Tensor | Integer matrix ops |
+| ID | Metric |
+|----|--------|
+| 155 | SM Activity |
+| 156 | SM Occupancy |
+| 203 | Tensor Active |
+| 1001-1004 | FP16/TF32/FP64/INT8 |
 
-**Temperature Policy Monitoring:**
+**Prometheus:**
 
 ```bash
-dcgmi policy --set 60,0 --target temperature  # Alert at 60C
-dcgmi policy --reg                            # Register policy
-dcgmi policy --get                            # Verify policy
+docker run -d --gpus all -p 9400:9400 nvcr.io/nvidia/k8s/dcgm-exporter:latest
 ```
-
-**Estimating TFLOPS:**
-
-```
-Estimated TFLOPS = Peak TFLOPS x SM Activity x SM Occupancy x Tensor Activity
-```
-
-Works for stable workloads; less accurate for bursty patterns.
-
-### nvtop
-
-Interactive GPU process viewer (like htop for GPUs).
-
-### Profiling Tools Comparison
-
-| Tool | Scope | Open Source |
-|------|-------|-------------|
-| DCGM/DCGMI | System-level metrics | Open core |
-| nvidia-smi | Basic utilization | Proprietary |
-| Nsight Compute | Kernel-level (SM detail) | Proprietary |
-| Nsight Systems | Micro-level profiling | Proprietary |
 
 ---
 
-## NVIDIA MIG (Multi-Instance GPU)
+## Multi-GPU Profiling
 
-Hardware-level GPU partitioning for isolation.
+### NVLink Topology
+
+```bash
+nvidia-smi topo -m
+# Output: NV12 = 12 NVLink connections between GPUs
+
+# Bandwidth test
+git clone https://github.com/NVIDIA/cuda-samples.git
+cd cuda-samples/Samples/5_Domain_Specific/p2pBandwidthLatencyTest && make
+./p2pBandwidthLatencyTest
+```
+
+### PCIe Bottleneck Detection
+
+```bash
+nvidia-smi dmon -s t                    # Watch PCIe throughput
+nvidia-smi -q -d PCIE                   # Link generation/width
+```
+
+**Mitigation:** Use pinned memory, overlap transfers, batch small transfers.
+
+### NCCL Collective Profiling
+
+```bash
+export NCCL_DEBUG=INFO                  # Basic logging
+export NCCL_DEBUG=TRACE                 # Detailed
+export NCCL_DEBUG_FILE=/tmp/nccl.%h.%p  # Per-host logs
+
+# Benchmark
+git clone https://github.com/NVIDIA/nccl-tests.git && cd nccl-tests && make
+./build/all_reduce_perf -b 8 -e 256M -f 2 -g 4
+```
+
+**Tuning variables:**
+
+| Variable | Purpose |
+|----------|---------|
+| NCCL_ALGO | Ring, Tree, CollNet |
+| NCCL_PROTO | Simple, LL, LL128 |
+| NCCL_BUFFSIZE | Per-channel buffer |
+
+---
+
+## AMD ROCm Profiling
+
+### Basic Tools
+
+```bash
+apt install rocm-dev
+rocm-smi                                # GPU status
+rocminfo                                # Hardware details
+rocm-smi --showuse                      # Utilization
+```
+
+### rocprof
+
+```bash
+rocprof ./my_hip_app                    # Default counters
+echo "pmc: SQ_WAVES,SQ_INSTS_VALU" > counters.txt
+rocprof -i counters.txt ./my_hip_app    # Custom counters
+```
+
+### Omniperf / rocprof-compute
+
+High-level profiler (renamed in ROCm 6.3).
+
+```bash
+omniperf profile -n workload -- ./my_hip_app
+omniperf analyze -p workloads/workload/MI300X/  # Web UI
+# ROCm 6.3+: rocprof-compute profile/analyze
+```
+
+### MI300X Specifics
+
+| Feature | Spec |
+|---------|------|
+| Memory | 192 GB HBM3 |
+| Bandwidth | 5.3 TB/s |
+| CUs | 304 |
+| Infinity Fabric | 896 GB/s |
+
+### ROCm vs CUDA
+
+| Aspect | CUDA | ROCm |
+|--------|------|------|
+| Kernel profiler | Nsight Compute | Omniperf |
+| System profiler | Nsight Systems | Omnitrace |
+| CLI | nvidia-smi | rocm-smi |
+| Partitioning | MIG | N/A |
+| Open source | No | Yes |
+
+---
+
+## CPU-GPU Optimization
+
+### Sync Bottleneck Detection
+
+**Symptoms:** Long `cudaDeviceSynchronize`, GPU idle between kernels.
+
+```cpp
+// Bad: blocking
+kernel1<<<...>>>(); cudaDeviceSynchronize(); kernel2<<<...>>>();
+
+// Good: streams
+kernel1<<<..., stream1>>>(); kernel2<<<..., stream2>>>();
+cudaEventRecord(event, stream1); cudaStreamWaitEvent(stream2, event);
+```
+
+### Memory Transfer Profiling
+
+```bash
+nsys profile -t cuda --cuda-memory-usage=true ./my_app
+```
+
+### Pinned Memory
+
+```cpp
+// Pinned (2x bandwidth vs pageable)
+cudaHostAlloc(&h_data, size, cudaHostAllocDefault);
+cudaMemcpyAsync(d_data, h_data, size, cudaMemcpyHostToDevice, stream);
+```
+
+### Unified Memory
+
+```bash
+nsys profile --cuda-um-cpu-page-faults=true --cuda-um-gpu-page-faults=true ./app
+```
+
+```cpp
+cudaMallocManaged(&data, size);
+cudaMemPrefetchAsync(data, size, deviceId, stream);  // Prefetch to GPU
+kernel<<<...>>>();
+cudaMemPrefetchAsync(data, size, cudaCpuDeviceId, stream);  // Back to CPU
+```
+
+---
+
+## Mixed Precision & Tensor Cores
+
+### Precision Formats
+
+| Format | Bits | Range | Use Case |
+|--------|------|-------|----------|
+| FP32 | 32 | ~1e38 | Default |
+| TF32 | 19 | ~1e38 | A100+ training |
+| FP16 | 16 | ~65k | Inference |
+| BF16 | 16 | ~1e38 | Training |
+| FP8 | 8 | ~448 | H100 |
+
+### H100 SXM Throughput
+
+| Precision | TFLOPS |
+|-----------|--------|
+| FP32 CUDA | 67 |
+| TF32 Tensor | 989 |
+| FP16/BF16 | 1,979 |
+| FP8 | 3,958 |
+
+### Profiling Tensor Cores
+
+```bash
+dcgmi dmon -e 203,1001,1002             # Tensor, FP16, TF32
+ncu --metrics sm__inst_executed_pipe_tensor.avg ./my_app
+```
+
+### PyTorch AMP
+
+```python
+from torch.cuda.amp import autocast, GradScaler
+scaler = GradScaler()
+with autocast():
+    output = model(data)
+    loss = criterion(output, target)
+scaler.scale(loss).backward()
+scaler.step(optimizer)
+```
+
+---
+
+## Container GPU Profiling
+
+### MPS in Containers
+
+```bash
+# Host
+nvidia-cuda-mps-control -d
+
+# Container
+docker run --gpus all -e CUDA_MPS_PIPE_DIRECTORY=/tmp/mps -v /tmp/mps:/tmp/mps app
+```
+
+### MIG in Containers
+
+```bash
+nvidia-smi mig -cgi 9,9 -C
+docker run --gpus '"device=MIG-xxxxx"' my_app
+```
+
+**Kubernetes strategies:** none, single, mixed (nvidia.com/mig-1g.10gb)
+
+### GPU Metrics in Kubernetes
+
+```yaml
+# DCGM Exporter DaemonSet
+image: nvcr.io/nvidia/k8s/dcgm-exporter:latest
+ports: [9400]
+```
+
+```promql
+DCGM_FI_DEV_GPU_UTIL{pod=~"training-.*"}
+DCGM_FI_PROF_PIPE_TENSOR_ACTIVE
+```
+
+---
+
+## Power & Thermal Management
+
+### Power Limiting
+
+```bash
+nvidia-smi -q -d POWER                  # Check limits
+nvidia-smi -pl 300                      # Set 300W
+nvidia-smi -pm 1                        # Persistence mode
+```
+
+**Systemd service:**
+
+```ini
+[Service]
+ExecStart=/usr/bin/nvidia-smi -pm 1
+ExecStart=/usr/bin/nvidia-smi -pl 300
+```
+
+### Thermal Throttle Detection
+
+```bash
+nvidia-smi -q -d PERFORMANCE
+# Check: SW/HW Thermal Slowdown, HW Power Brake
+
+watch -n 1 'nvidia-smi -q -d PERFORMANCE | grep -A5 "Clocks Throttle"'
+```
+
+| Reason | Severity |
+|--------|----------|
+| SwPowerCap | Normal |
+| SwThermalSlowdown | Warning |
+| HwThermalSlowdown | Critical |
+| HwPowerBrakeSlowdown | Critical |
+
+---
+
+## Quick Diagnosis
+
+| Symptom | Cause | Tool |
+|---------|-------|------|
+| High util, low throughput | Memory-bound | ncu roofline |
+| GPU idle between kernels | CPU bottleneck | nsys timeline |
+| High PCIe traffic | Transfer-bound | dmon -s t |
+| Tensor Active = 0% | Wrong precision | DCGM 203 |
+| HW Thermal Slowdown | Cooling issue | -q -d PERFORMANCE |
+
+```bash
+# Memory vs compute bound
+ncu --metrics gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed,\
+sm__throughput.avg.pct_of_peak_sustained_elapsed ./my_app
+```
+
+---
+
+## MIG (Multi-Instance GPU)
+
+Hardware-level partitioning for isolation (A100, H100).
 
 ### MIG vs MPS vs Time-Slicing
 
@@ -93,375 +417,114 @@ Hardware-level GPU partitioning for isolation.
 | Context Switch | None | Minimal | High |
 | Max Instances | 7 | Many | 1 active |
 | QoS Guarantee | Yes | No | No |
-| Use Case | Production | Dev/test | Single job |
 
-### MIG Concepts
-
-**Hierarchy:**
-1. GPU Instance (GI) - Memory + Compute slices
-2. Compute Instance (CI) - Allocated within GI
-
-**Slice allocation:** Memory first, then compute assigned.
-
-### MIG Configuration
+### Configuration
 
 ```bash
-# Enable MIG mode (requires reboot/reset)
-nvidia-smi -i 0 -mig 1
+nvidia-smi -i 0 -mig 1                  # Enable MIG (requires reset)
+nvidia-smi mig -lgip                    # List profiles
+nvidia-smi mig -cgi 9 -C                # Create 3g.40gb instance
+nvidia-smi mig -lgi                     # List instances
+nvidia-smi -L                           # Show MIG UUIDs
 
-# List available profiles
-nvidia-smi mig -lgip
-
-# Create GPU Instance (profile ID 9 = 3g.40gb on H100)
-nvidia-smi mig -cgi 9 -C            # Create GI + default CI
-nvidia-smi mig -cgi 9,9             # Two 3g.40gb instances
-
-# Create Compute Instance within GI
-nvidia-smi mig -i 0 -gi 0 -cci 0    # Full CI for GI 0
-
-# List instances
-nvidia-smi -L                        # Shows MIG UUIDs
-nvidia-smi mig -lgi                  # List GPU instances
-nvidia-smi mig -lci                  # List compute instances
-```
-
-**Run workload on MIG instance:**
-
-```bash
 export CUDA_VISIBLE_DEVICES=MIG-<uuid>
 python train.py
 ```
 
-### MIG Partition Profiles (H100 80GB)
+### H100 Profiles
 
-| Profile | Memory | SMs | Use Case |
-|---------|--------|-----|----------|
-| 1g.10gb | ~10GB | 16 | Small inference |
-| 2g.20gb | ~20GB | 32 | Medium workloads |
-| 3g.40gb | ~40GB | 60 | Large models |
-| 4g.40gb | ~40GB | 60 | Balanced |
-| 7g.80gb | ~80GB | 132 | Full GPU |
+| Profile | Memory | SMs | Instances |
+|---------|--------|-----|-----------|
+| 1g.10gb | ~10GB | 16 | Up to 7 |
+| 2g.20gb | ~20GB | 32 | Up to 3 |
+| 3g.40gb | ~40GB | 60 | Up to 2 |
+| 7g.80gb | ~80GB | 132 | 1 |
 
-**Key insight:** Overhead exists. 7x 1g instances = ~70GB (10GB unused). 132 SMs / 7 = 18.8, rounded to 16 per instance.
+---
 
-### MIG Partition Combinations
+## Clock Management
 
-**Efficient combinations (no wasted compute):**
-- 7x 1g.10gb
-- 1x 7g.80gb
-- 3x 2g.20gb + 1x 1g.10gb
-- 1x 4g.40gb + 1x 3g.40gb
-
-**Wasteful combinations (1 compute slice unused):**
-- 2x 3g.40gb (6/7 compute used)
-- 3x 2g.20gb (6/7 compute used)
-
-### MIG + MPS Hybrid
+### Lock Clocks for Benchmarking
 
 ```bash
-# MPS can run inside MIG instance
-export CUDA_VISIBLE_DEVICES=MIG-<uuid>
-nvidia-cuda-mps-control -d
+# Lock GPU clocks (reduces variance)
+nvidia-smi -lgc 1500,1500               # Lock at 1500 MHz
+nvidia-smi -rgc                         # Reset to default
 
-# Note: Cannot create MIG while MPS running
-echo quit | nvidia-cuda-mps-control
+# Lock memory clocks
+nvidia-smi -lmc 1215,1215
+nvidia-smi -rmc
+```
+
+### Query Clock Reasons
+
+```bash
+nvidia-smi -q -d CLOCK
+# Shows: Graphics, SM, Memory, Video clocks
+# Shows: Max clocks and current clocks
 ```
 
 ---
 
-## AMD GPU / ROCm
+## Profiling Workflows
 
-### ROCm Open Source Stack
-
-AMD's GPU compute stack is fully open source.
-
-**Components:**
-- Kernel driver: `amdgpu` (in mainline Linux)
-- User space: `rocm` (GitHub)
-- ISA documentation: `amd.com/en/support/tech-docs`
+### Training Job Workflow
 
 ```bash
-# Installation
-apt install rocm-dev
+# 1. Quick health check
+nvidia-smi -q -d HEALTH
+dcgmi diag -r 1
 
-# GPU info
-rocm-smi
-rocminfo
+# 2. Profile first few iterations
+nsys profile --duration=60 --delay=30 -o train_profile ./train.py
+
+# 3. Check for tensor core usage
+dcgmi dmon -e 203,1001 -c 60
+
+# 4. Deep-dive slow kernels
+ncu -k "slow_kernel" --set full ./train.py
 ```
 
-### SIMT vs Vector Programming
-
-**SIMT (Single Instruction Multiple Thread):** CUDA/HIP programming model where scalar code implicitly operates on 32/64 lanes.
-
-**Direct vector approach:** Write explicit SIMD/vector code targeting GPU vector units.
-
-```
-# SIMT model (implicit vectorization)
-int x = compute();  // Actually vector of 32/64 ints
-
-# Vector model (explicit)
-v32int x = vector_compute();
-```
-
-AMD's ISA allows both approaches; LLVM defaults to SIMT model.
-
----
-
-## eBPF for GPU Instrumentation
-
-### Beyla GPU Probes (Grafana)
-
-eBPF-based auto-instrumentation for CUDA workloads.
-
-**Advantages:**
-- Auto-instrumentation (no code changes)
-- Framework-agnostic (PyTorch, TensorFlow, etc.)
-- Lower overhead than profiler-based approaches
-- Kubernetes-native with automatic metadata decoration
-
-**Instrumented CUDA Functions:**
-
-```c
-// CUDA Launch Kernel - tracks kernel dispatches
-CUresult cuLaunchKernel(
-    CUfunction func,          // Function offset for kernel name
-    unsigned int gridDimX,    // Grid dimensions (cardinality)
-    unsigned int gridDimY,
-    unsigned int gridDimZ,
-    unsigned int blockDimX,   // Block dimensions
-    ...
-);
-
-// CUDA Memory Operations
-cudaMalloc()                   // Memory allocation (model load)
-cudaMemcpy()                   // Host<->Device transfers
-```
-
-**Metrics Generated:**
-
-```promql
-# Kernel launches by name
-gpu_kernel_launch_total{kernel_name="matmul_fp16"}
-
-# Memory transfer direction
-gpu_memcpy_bytes{direction="host_to_device"}
-gpu_memcpy_bytes{direction="device_to_host"}
-
-# Grid/block cardinality for resource estimation
-gpu_kernel_grid_size
-gpu_kernel_block_size
-```
-
-**Limitations:**
-- No kernel execution time (async dispatch)
-- No GPU hardware metrics (temperature, power)
-- CPU-side instrumentation only
-
-**Stack Trace Capture:**
-
-```c
-bpf_get_stack(ctx, stack, sizeof(stack), BPF_F_USER_STACK);
-```
-
-Note: Frame pointers often optimized away; use DWARF unwinding for full stacks.
-
----
-
-## HPC Tracing (LTTng)
-
-### LTTng Overview
-
-Low-overhead kernel/userspace tracing for HPC supercomputers (El Capitan, Aurora scale).
-
-**Instrumented Layers:**
-- HIP/HSA (AMD GPU runtime)
-- ROCm/RocTX
-- GPU Kernel Dispatch
-- MPI (OpenMPI, Cray MPI)
-- Linux Kernel
-
-**Setup:**
+### Inference Optimization Workflow
 
 ```bash
-# Start session daemon
-lttng-sessiond --daemonize
+# 1. Baseline latency
+nsys profile --stats=true ./inference.py
 
-# Create trace session
-lttng create hpc-session
+# 2. Check memory vs compute bound
+ncu --set basic ./inference.py
 
-# Enable kernel events
-lttng enable-event -k sched_switch,sched_wakeup
+# 3. Profile with different batch sizes
+for bs in 1 4 16 64; do
+    nsys profile -o batch_$bs ./inference.py --batch=$bs
+done
 
-# Enable userspace HIP/HSA events
-lttng enable-event -u 'hip:*'
-lttng enable-event -u 'hsa:*'
-lttng enable-event -u 'mpi:*'
+# 4. Compare reports
+nsys stats batch_*.nsys-rep
 ```
 
-### LTTng Features for HPC
-
-- **Per-CPU ring buffer:** ~100ns per event
-- **Flight recorder mode:** In-memory tracing, capture on trigger
-- **Session rotation:** Split traces into chunks for pipeline analysis
-- **Cross-host correlation:** NTP/PTP time sync, TCP sequence realignment
+### Multi-Node Debugging
 
 ```bash
-# Flight recorder (snapshot) mode
-lttng enable-channel -u --type=snapshot my-channel
-lttng enable-event -u -c my-channel 'hip:*'
-lttng start
-# ... trigger condition ...
-lttng snapshot record
+# Enable NCCL debug on all nodes
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,NET
 
-# Session rotation (periodic chunks)
-lttng enable-rotation --timer 60s
+# Profile with node-specific output
+nsys profile -o node_${SLURM_NODEID} ./train.py
+
+# Check for network issues
+NCCL_DEBUG=TRACE NCCL_DEBUG_SUBSYS=NET ./train.py 2>&1 | grep -E "NCCL|error"
 ```
-
-### CTF (Common Trace Format)
-
-Binary trace format for HPC scale.
-
-- Self-describing metadata (JSON in CTF2)
-- Compact binary data stream
-- Clock descriptions for correlation
-- User-defined metadata extensions
-
-```bash
-# Read CTF trace
-babeltrace2 ~/lttng-traces/my-session
-
-# Convert to other formats
-babeltrace2 input-trace --output-format=ctf2 --output=output-trace
-```
-
-### Trace Compass Visualization
-
-Eclipse-based trace analyzer with:
-- Resource view (CPU states, frequency)
-- Control flow view (thread timeline)
-- Critical path analysis
-- Network packet correlation
-
-**Key views for HPC:**
-- MPI rank timeline
-- GPU kernel dispatch events
-- Host-to-device memory transfers
-
-### TAPI (Argonne National Lab)
-
-LTTng-based instrumentation for Aurora (10K nodes, 9M cores).
-
-Instruments: OpenCL, Level Zero, CUDA Runtime, HIP, OpenMP Target.
-
----
-
-## Cluster Monitoring
-
-### Cluster Cockpit
-
-Job-specific performance monitoring for HPC clusters.
-
-**Architecture:**
-
-```
-[Metric Collector] --JSON--> [Metric Store] <--query-- [Backend/UI]
-     (per node)               (in-memory)              (job archive)
-```
-
-**Metric collector plugins:**
-- `likwid` - Hardware performance counters
-- `cpustat` - CPU load
-- `memstat` - Memory usage
-- `ibstat` - InfiniBand metrics
-- `nvidia` - GPU metrics via NVML
-
-**Metrics tracked per job:**
-- CPU utilization (per core/socket/node)
-- Memory bandwidth consumption
-- Floating-point operations (FLOPS)
-- Network I/O (InfiniBand)
-- GPU utilization (if applicable)
-
-### Automated Job Analysis
-
-Rule-based job quality assessment.
-
-```json
-{
-  "tag": "low_cpu_load",
-  "threshold": "config.low_cpu_threshold",
-  "metrics": ["cpu_load"],
-  "vars": {
-    "avg_load": "mean(cpu_load.data)",
-    "low_load": "avg_load < threshold"
-  },
-  "trigger": "low_load == True"
-}
-```
-
-**Built-in rules:**
-- Low CPU load
-- CPU load imbalance
-- Excessive CPU load
-- Memory underutilization
-- Network idle time
-
-**Key insight:** 20-50% of jobs show problematic behavior patterns.
-
-### Roofline Analysis
-
-Spider/radar diagram for job efficiency:
-
-```
-          Memory BW
-             /\
-            /  \
-           /    \
-     FLOPS ------  Memory Used
-```
-
-Full triangle = efficient resource utilization.
-
----
-
-## Common Bottlenecks and Patterns
-
-### GPU Training Failures
-
-Large-scale training statistics (16K GPUs over 54 days):
-- 58% of training stalls due to GPU issues
-- 1-3% GPU hardware failure rate (overheat, fall off bus)
-- eBPF cannot help with hardware errors
-
-### Memory-Bound Detection
-
-**Pattern:** High SM occupancy + Low SM activity + High VRAM = Memory-bound
-
-Typical for inference workloads where CPU-GPU data transfer is the bottleneck.
-
-### Tensor Core Utilization
-
-- FP32 defaults to CUDA cores (no tensor acceleration)
-- FP16/TF32 use tensor cores (8-10x speedup)
-- Check with DCGM metrics 203, 1001-1004
-
-### Tracing vs Profiling
-
-| Aspect | Profiling | Tracing |
-|--------|-----------|---------|
-| Overhead | Low (sampling) | Must be low |
-| Best for | Active resource use | Resource misuse |
-| Output | Aggregated stats | Event sequence |
-| Scale | Single job | Cluster-wide |
-
-**Key insight:** Tracing excels at finding why resources are NOT being used (waiting, stalls, dependencies).
 
 ---
 
 ## References
 
-- DCGM Exporter: `github.com/NVIDIA/dcgm-exporter`
-- Cluster Cockpit: `github.com/ClusterCockpit`
-- Beyla GPU: `github.com/grafana/beyla`
-- Azure HPC Node Health: `github.com/Azure/azurehpc`
-- TAPI: `github.com/argonne-lcf/THAPI`
+- NVIDIA Nsight: docs.nvidia.com/nsight-systems, docs.nvidia.com/nsight-compute
+- NVIDIA DCGM: docs.nvidia.com/datacenter/dcgm
+- AMD ROCm: rocm.docs.amd.com
+- Omniperf: rocm.docs.amd.com/projects/omniperf
+- NCCL: docs.nvidia.com/deeplearning/nccl
+- CUDA Samples: github.com/NVIDIA/cuda-samples
+- NCCL Tests: github.com/NVIDIA/nccl-tests

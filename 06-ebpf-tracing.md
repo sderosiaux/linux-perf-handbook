@@ -271,11 +271,36 @@ funclatency-bpfcc -m vfs_read  # Milliseconds
 stackcount-bpfcc 'vfs_read'    # Stack traces by count
 ```
 
-## sched_ext: eBPF-Based Schedulers
+## sched_ext: eBPF-Based Schedulers (Mainline 6.12+)
 
-sched_ext enables custom CPU schedulers via eBPF, available in Linux 6.12+.
+sched_ext is now merged into mainline Linux (6.12+), enabling custom CPU schedulers via eBPF without kernel patches. Production-ready schedulers available in the [scx repository](https://github.com/sched-ext/scx).
 
-**Minimal FIFO Scheduler Pattern:**
+### Available Schedulers
+
+| Scheduler | Use Case | Notes |
+|-----------|----------|-------|
+| `scx_lavd` | Latency-sensitive (gaming, desktop) | Meta's fleet default |
+| `scx_rusty` | Throughput-optimized | Good for batch workloads |
+| `scx_simple` | Learning/debugging | Minimal implementation |
+| `scx_central` | Single-queue experiments | For scheduler research |
+
+### Quick Start (6.12+)
+
+```bash
+# Install from scx repo
+git clone https://github.com/sched-ext/scx
+cd scx && meson setup build && ninja -C build
+sudo ./build/scheds/rust/scx_lavd
+
+# Check active scheduler
+cat /sys/kernel/sched_ext/root/ops
+
+# Revert to default (CFS/EEVDF)
+# Simply terminate the scx process (Ctrl+C)
+```
+
+### Minimal FIFO Scheduler Pattern
+
 ```c
 // enqueue: task ready to run
 SEC("struct_ops/enqueue")
@@ -291,7 +316,8 @@ void BPF_PROG(dispatch, s32 cpu, struct task_struct *p) {
 }
 ```
 
-**Lottery Scheduler Pattern:**
+### Lottery Scheduler Pattern
+
 ```c
 // Random backend selection from queue
 u64 random_idx = bpf_get_prandom_u32() % queue_len;
@@ -305,11 +331,11 @@ bpf_for_each(scx_dsq, p, SHARED_DSQ, 0) {
 
 **Safety:** If scheduler hangs for 30 seconds, kernel automatically kicks it and falls back to default scheduler.
 
-**Key insight:** 10 lines of C can implement a working scheduler - massive reduction in barrier to entry for scheduler research/optimization.
+**Key insight:** 10 lines of C can implement a working scheduler. Meta runs scx_lavd as default fleet scheduler across diverse workloads.
 
-## Netkit: BPF-Programmable Network Device
+## Netkit: BPF-Programmable Network Device (Stable 6.7+)
 
-Netkit solves network namespace performance overhead. Traditional veth pairs add extra hops (TX -> virtual cable -> RX -> softIRQ -> TX to NIC). Netkit creates a primary/peer device pair with built-in BPF attach points.
+Netkit is stable in Linux 6.7+ and solves network namespace performance overhead. Traditional veth pairs add extra hops (TX -> virtual cable -> RX -> softIRQ -> TX to NIC). Netkit creates a primary/peer device pair with built-in BPF attach points.
 
 **Performance Impact:**
 - veth: ~60% of host network performance
@@ -321,9 +347,25 @@ Netkit solves network namespace performance overhead. Traditional veth pairs add
 - BPF programs at TX side redirect directly to physical NIC queue
 - Greatly reduces softIRQ overhead
 
+### Quick Start (6.7+)
+
+```bash
+# Create netkit pair
+ip link add nk0 type netkit peer name nk1
+
+# Move peer to container namespace
+ip link set nk1 netns <container_pid>
+
+# Attach BPF program (required - default drops all traffic)
+bpftool net attach netkit_primary id <prog_id> dev nk0
+
+# Check attached programs
+bpftool net show dev nk0
+```
+
 **Requirements:**
-- Kernel support for netkit
-- Updated iproute2/bpftool with netkit support
+- Linux 6.7+ with CONFIG_NETKIT=y
+- iproute2 6.7+ / bpftool with netkit support
 - BPF programs must be attached (default drops all traffic)
 
 **Key insight:** Netkit is transparent to containers - no application changes required, just swap veth for netkit.
@@ -588,6 +630,46 @@ perf stat -M TopdownL1 -- ./your_bpf_benchmark
 
 **Key insight:** Turbo boost + tight loops can overwhelm ring buffer infrastructure leading to more dropped events than slower, randomized workloads.
 
+## BPF Arena & Modern kfuncs (6.9+)
+
+BPF Arena (Linux 6.9+) provides shared memory regions accessible from both BPF programs and userspace, enabling complex data structures previously impossible.
+
+### Arena Basics
+
+```c
+// Define arena in BPF program
+struct {
+    __uint(type, BPF_MAP_TYPE_ARENA);
+    __uint(map_flags, BPF_F_MMAPABLE);
+    __uint(max_entries, 1024 * 1024);  // 1MB
+} arena SEC(".maps");
+
+// Allocate within arena
+void *ptr = bpf_arena_alloc(&arena, size);
+```
+
+### Key New kfuncs (6.8+)
+
+| kfunc | Purpose | Added |
+|-------|---------|-------|
+| `bpf_arena_alloc` | Arena memory allocation | 6.9 |
+| `bpf_arena_free` | Arena memory deallocation | 6.9 |
+| `bpf_iter_css_task_new` | Iterate cgroup tasks | 6.8 |
+| `bpf_cpumask_*` | CPU mask manipulation | 6.3 |
+| `bpf_rcu_read_lock` | RCU read-side locking | 6.4 |
+
+### Memory Tiering with BPF (CXL Support)
+
+Linux 6.x series added CXL (Compute Express Link) memory tiering support. BPF can now influence memory placement:
+
+```c
+// Use with DAMON for tiered memory management
+// Hot pages on fast NUMA nodes, cold pages on CXL-attached memory
+bpf_cpumask_set_cpu(cpu, mask);  // Control placement
+```
+
+**Key insight:** Arena enables linked lists, trees, and other pointer-based structures in BPF - previously limited to fixed-size maps.
+
 ## Verifier Tips
 
 Verifier comparison across kernel versions (4.18 to 6.10):
@@ -728,6 +810,8 @@ echo '-:myprobe' >> /sys/kernel/debug/tracing/kprobe_events
 
 ## Flame Graph Pipeline
 
+For detailed flame graph analysis, see [Performance Profiling](05-performance-profiling.md#flame-graphs).
+
 ```bash
 # CPU flame graph with BCC
 profile-bpfcc -f -p PID 30 | flamegraph.pl > cpu.svg
@@ -754,3 +838,10 @@ stackcollapse.pl out.stacks | flamegraph.pl > out.svg
 | Function count | `funccount-bpfcc 'vfs_*'` |
 | Custom tracing | `bpftrace -e '...'` |
 | Kernel tracing | `trace-cmd record -e event` |
+
+## See Also
+
+- [Performance Profiling](05-performance-profiling.md) - perf, flame graphs, language profilers
+- [Kernel Tuning](08-kernel-tuning.md) - sched_ext schedulers, CPU/memory tuning
+- [Network Tuning](09-network-tuning.md) - XDP use cases, network optimization
+- [Containers & K8s](07-containers-k8s.md) - container-aware tracing

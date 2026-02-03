@@ -571,6 +571,54 @@ net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.ip_local_port_range = 1024 65535
 ```
 
+## io_uring for Networking (5.19+)
+
+io_uring provides significant performance improvements for network I/O, with major enhancements in 6.x kernels.
+
+### Key Features by Kernel Version
+
+| Version | Feature | Impact |
+|---------|---------|--------|
+| 5.19+ | Multishot accept | Single SQE handles multiple accepts |
+| 6.0+ | Multishot receive | Single SQE handles multiple recvs |
+| 6.1+ | Provided buffers v2 | More efficient buffer management |
+| 6.4+ | Zero-copy send | Eliminates copy on transmit |
+| 6.7+ | Registered ring fds | Reduce fd lookup overhead |
+
+### Multishot Accept Pattern
+
+```c
+// Single SQE handles unlimited accepts
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_multishot_accept(sqe, listen_fd, NULL, NULL, 0);
+
+// Each completion (CQE) delivers one connection
+// CQE_F_MORE flag indicates more completions coming
+```
+
+### Provided Buffers (Zero-Copy Receive)
+
+```c
+// Register buffer ring with kernel
+struct io_uring_buf_ring *br;
+io_uring_register_buf_ring(&ring, &br_params, 0);
+
+// Prep multishot recv with buffer selection
+io_uring_prep_recv_multishot(sqe, fd, NULL, 0, 0);
+sqe->flags |= IOSQE_BUFFER_SELECT;
+sqe->buf_group = buf_group_id;
+```
+
+### Performance Comparison
+
+| Approach | Connections/sec | Syscalls |
+|----------|-----------------|----------|
+| epoll + accept | 80,000 | High |
+| io_uring accept | 120,000 | Medium |
+| io_uring multishot | 200,000+ | Minimal |
+
+**Key insight:** Multishot operations eliminate the syscall-per-event overhead that limits epoll. A single SQE submission can handle thousands of connections.
+
 ## Quick Reference
 
 | Task | Setting |
@@ -585,3 +633,10 @@ net.ipv4.ip_local_port_range = 1024 65535
 | Set RSS queues | `ethtool -L eth0 combined 8` |
 | Set ring buffer | `ethtool -G eth0 rx 4096` |
 | Enable TSO | `ethtool -K eth0 tso on` |
+
+## See Also
+
+- [eBPF & Tracing](06-ebpf-tracing.md) - XDP, netkit, BPF networking
+- [Kernel Tuning](08-kernel-tuning.md) - NUMA, CPU isolation for network workloads
+- [Network Analysis](03-network-analysis.md) - Diagnostic tools, traffic capture
+- [Containers & K8s](07-containers-k8s.md) - Container networking, CNI tuning
