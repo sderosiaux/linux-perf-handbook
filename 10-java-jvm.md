@@ -2,6 +2,90 @@
 
 JVM monitoring, profiling, and tuning for Java 21+ (LTS).
 
+## Emergency Triage: First 5 Minutes
+
+When paged at 3am, run this decision tree:
+
+```bash
+# 1. Is the JVM even the problem?
+top -p $(pgrep -f java) -H      # CPU? Which threads?
+iostat -x 1 3                    # Disk I/O starving you?
+ss -s                            # Socket exhaustion?
+dmesg | tail -20                 # OOM killer? cgroup limits?
+
+# 2. Is it OOM killed?
+dmesg | grep -i "kill.*java\|oom"
+cat /sys/fs/cgroup/memory.events 2>/dev/null | grep oom  # cgroup v2
+
+# 3. Is it a deadlock?
+jstack PID | grep -i "deadlock"
+
+# 4. Is it a GC death spiral?
+jstat -gcutil PID 1000 5
+# RED FLAGS: FGC incrementing fast, OU >90% after FGC, GCT/uptime >10%
+
+# 5. Is it stuck/hung?
+jstack PID > /tmp/stack1.txt; sleep 10; jstack PID > /tmp/stack2.txt
+diff /tmp/stack1.txt /tmp/stack2.txt  # Same stacks = stuck
+
+# 6. Is it container CPU throttled?
+cat /sys/fs/cgroup/cpu.stat 2>/dev/null | grep throttled
+# nr_throttled > 0 = you're being throttled
+```
+
+### GC Death Spiral Detection
+
+```bash
+# Quick death spiral check
+jstat -gcutil PID 1000 10 | awk '
+  NR>1 && $4 > 90 && $8 > 10 {
+    print "WARNING: Old gen " $4 "% full, GC time " $8 "%"
+  }
+  NR>1 && prev_fgc && $8 > prev_fgc {
+    print "CRITICAL: Full GC rate increasing"
+  }
+  { prev_fgc = $8 }
+'
+```
+
+**Death spiral indicators:**
+- `FGC` count increasing faster than `YGC`
+- `OU` (Old Used) consistently >90% after Full GC
+- `GCT` / uptime > 10-20%
+- Back-to-back Full GCs with no memory reclaimed
+
+### Thread Dump Triage Patterns
+
+```bash
+# Find bottleneck: 100 threads BLOCKED on same monitor
+jstack PID | grep -E "BLOCKED|waiting to lock" | sort | uniq -c | sort -rn
+
+# Find what everyone is waiting for
+jstack PID | grep -B5 "BLOCKED" | grep "waiting on"
+
+# Connection pool starvation (common silent killer)
+jstack PID | grep -A2 "pool-" | grep -c WAITING
+
+# High CPU thread identification
+top -H -p PID -n 1 | head -20  # Get thread ID (decimal)
+printf '%x\n' THREAD_ID        # Convert to hex
+jstack PID | grep -A 30 "nid=0xHEX"
+```
+
+### When jstack Won't Work
+
+```bash
+# JVM frozen? Force thread dump to stdout/stderr
+kill -3 PID  # SIGQUIT - works when jstack hangs
+
+# Hardcore: gdb when JVM is completely stuck
+gdb -p PID -batch -ex "thread apply all bt"
+
+# Container: enter namespace first
+docker exec -it CONTAINER jcmd 1 Thread.print
+nsenter -t $(docker inspect -f '{{.State.Pid}}' CONTAINER) -a jstack 1
+```
+
 ## JVM Monitoring
 
 ### jps (Java Process Status)
@@ -287,7 +371,206 @@ var scope = StructuredTaskScope.open(Joiner.allSuccessfulOrThrow());
 -Xlog:gc+ergo=debug                # Ergonomic decisions
 ```
 
-### GC-Friendly Coding Patterns
+### TLAB (Thread-Local Allocation Buffers)
+
+TLABs allow threads to allocate objects without synchronization - critical for allocation-heavy workloads.
+
+```bash
+# TLAB configuration
+-XX:TLABSize=512k                  # Initial TLAB size (auto-sized by default)
+-XX:MinTLABSize=2k                 # Minimum TLAB size
+-XX:TLABWasteTargetPercent=1       # Max wasted space in TLAB (default: 1%)
+-XX:+ResizeTLAB                    # Dynamic TLAB sizing (default: on)
+
+# Diagnostic
+-Xlog:gc+tlab=debug                # TLAB statistics
+```
+
+**Why TLAB matters:**
+- Allocation inside TLAB: pointer bump (fast)
+- Allocation outside TLAB: requires synchronization (slow, ~10x slower)
+- Large objects skip TLAB entirely
+
+**JFR allocation events:**
+```bash
+# Inside TLAB (cheap)
+jfr print --events jdk.ObjectAllocationInNewTLAB recording.jfr
+
+# Outside TLAB (expensive - investigate these)
+jfr print --events jdk.ObjectAllocationOutsideTLAB recording.jfr
+
+# Sampled allocations (low overhead)
+jfr print --events jdk.ObjectAllocationSample recording.jfr
+```
+
+**Allocation profiling with async-profiler:**
+```bash
+# Allocation flame graph
+./asprof -e alloc -d 60 -f alloc.html PID
+
+# Interpretation: wide bars = allocating lots of objects
+# Focus on outside-TLAB allocations for optimization
+```
+
+## Safepoint Analysis
+
+Safepoints are points where all application threads must stop for JVM operations (GC, deoptimization, etc.). Long time-to-safepoint (TTSP) causes latency spikes.
+
+```bash
+# Enable safepoint logging
+-Xlog:safepoint:file=safepoint.log:time,uptime
+
+# Log output example:
+# [safepoint] Safepoint "G1CollectFull", Time since last: 1234 ms, Reaching safepoint: 5 ms
+#                                                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+#                                                          This is TTSP - should be <1ms
+```
+
+**Safepoint triggers:**
+- GC pauses
+- Deoptimization
+- Biased lock revocation (removed in JDK 15+)
+- Thread dump
+- JVMTI operations
+- Class redefinition
+
+### Diagnosing Safepoint Stalls
+
+```bash
+# JFR safepoint events
+jfr print --events jdk.SafepointBegin,jdk.SafepointEnd recording.jfr
+
+# Find slow TTSP (sync time)
+jfr print --events jdk.SafepointBegin recording.jfr | grep -A5 "sync"
+```
+
+**Common TTSP causes:**
+1. **Counted loops without safepoint polls** - Long loops delay safepoint
+2. **Native code (JNI)** - No safepoint while in native
+3. **Large array operations** - System.arraycopy, Arrays.fill
+4. **NIO mapped buffers** - File I/O
+
+```bash
+# Safepoint interval tuning
+-XX:GuaranteedSafepointInterval=0      # Disable periodic safepoints (default: 1000ms)
+
+# For low-latency: enable safepoints in counted loops (slight CPU overhead)
+-XX:+UseCountedLoopSafepoints          # Default: on in recent JDKs
+
+# Debug: show which threads delay safepoint
+-XX:+SafepointTimeout -XX:SafepointTimeoutDelay=1000
+```
+
+## Escape Analysis & Scalar Replacement
+
+Objects that don't escape a method can be stack-allocated (eliminated).
+
+```bash
+# Enable escape analysis (default: on)
+-XX:+DoEscapeAnalysis
+
+# Diagnostic: see which allocations are eliminated
+-XX:+UnlockDiagnosticVMOptions -XX:+PrintEscapeAnalysis
+
+# See scalar replacement (object fields → local variables)
+-XX:+EliminateAllocations              # Default: on
+```
+
+**Escape analysis requirements:**
+- Object doesn't escape method (not stored in field, not passed out)
+- Object is small enough
+- Method is inlined (important!)
+
+```java
+// ESCAPES - heap allocated
+void process() {
+    User user = new User(name);
+    cache.put(id, user);  // Escapes via field store
+}
+
+// DOESN'T ESCAPE - candidate for stack allocation
+void calculate() {
+    Point p = new Point(x, y);  // Only used locally
+    return p.x + p.y;
+}
+```
+
+**Verify with JITWatch**: TriView shows eliminated allocations.
+
+## Lock Contention Analysis
+
+Beyond basic `-e lock` profiling.
+
+```bash
+# async-profiler lock profiling
+./asprof -e lock -d 60 -f lock.html PID
+
+# JFR lock events
+jfr print --events jdk.JavaMonitorWait,jdk.JavaMonitorEnter recording.jfr
+```
+
+**Lock optimization (JIT):**
+```bash
+# Lock coarsening: merge adjacent locks
+-XX:+EliminateLocks                    # Default: on
+
+# Verify lock elimination in JITWatch
+# Look for "lock coarsening" or "lock elision" in compilation log
+```
+
+**Biased locking (historical):**
+- JDK 1-14: Biased locking default on (optimize uncontended locks)
+- JDK 15+: Deprecated and disabled
+- JDK 18+: Removed entirely
+- Impact: Legacy code with uncontended `synchronized` may be slightly slower
+
+**Monitor inflation stages:**
+1. Thin lock (stack-based, uncontended)
+2. Fat lock (OS mutex, contended)
+
+```bash
+# Inflation events
+-Xlog:monitorinflation=debug
+```
+
+## False Sharing & @Contended
+
+False sharing: Different threads modify adjacent memory, causing cache line bouncing.
+
+```java
+// PROBLEM: x and y on same cache line (64 bytes)
+class Counter {
+    volatile long x;  // Thread A writes
+    volatile long y;  // Thread B writes - invalidates A's cache line
+}
+
+// SOLUTION: Pad to separate cache lines
+class Counter {
+    @jdk.internal.vm.annotation.Contended
+    volatile long x;
+
+    @jdk.internal.vm.annotation.Contended
+    volatile long y;
+}
+```
+
+```bash
+# Enable @Contended (required for non-JDK classes)
+--add-opens java.base/jdk.internal.vm.annotation=ALL-UNNAMED
+-XX:-RestrictContended
+```
+
+**Detection with JOL (Java Object Layout):**
+```bash
+# Add JOL dependency
+# org.openjdk.jol:jol-core:0.17
+
+# Print object layout
+java -jar jol-cli.jar internals com.example.Counter
+# Shows field offsets - fields within 64 bytes = potential false sharing
+```
+
+## GC-Friendly Coding Patterns
 
 Real-world data shows 25-50% CPU time spent on GC in high-throughput systems.
 
@@ -379,16 +662,114 @@ jmap -dump:format=b,file=heap.hprof PID       # Heap dump
 jmap -dump:live,format=b,file=heap.hprof PID  # Live only
 ```
 
-### Heap Dump Analysis
+### Heap Dump Analysis Workflow
+
+**Step 1: Get the dump**
 ```bash
-# Eclipse MAT (Memory Analyzer Tool)
+# Live dump (forces GC first - preferred for leak analysis)
+jmap -dump:live,format=b,file=heap.hprof PID
+
+# Full dump (includes unreachable objects)
+jmap -dump:format=b,file=heap.hprof PID
+
+# JFR-based (works when jmap hangs)
+jcmd PID GC.heap_dump /tmp/heap.hprof
+```
+
+**Step 2: Open in Eclipse MAT**
+```bash
+# Download: https://eclipse.dev/mat/downloads.php
+# Increase MAT heap for large dumps:
+# Edit MemoryAnalyzer.ini: -Xmx8g
+
 mat heap.hprof
+```
 
-# JDK Mission Control
-jmc
+**Step 3: Analysis workflow**
+1. **Leak Suspects Report** - Auto-generated, start here
+2. **Dominator Tree** - Objects that retain the most memory
+3. **Histogram** - Object count by class (sort by retained heap)
+4. **Path to GC Roots** - Why object isn't collected
+5. **OQL Queries** - Custom queries
 
-# Command line histogram from dump
-jcmd PID GC.class_histogram
+**Key concepts:**
+- **Shallow heap**: Memory consumed by object itself
+- **Retained heap**: Memory freed if object is GC'd (includes dominated objects)
+- **Dominator**: Object X dominates Y if every path from GC root to Y goes through X
+
+**MAT OQL examples:**
+```sql
+-- Find large byte arrays
+SELECT * FROM byte[] WHERE @retainedHeapSize > 1000000
+
+-- Find duplicate strings
+SELECT toString(s), count(s), sum(s.@retainedHeapSize)
+FROM java.lang.String s GROUP BY toString(s) HAVING count(s) > 100
+
+-- Find classloader leaks
+SELECT * FROM java.lang.ClassLoader WHERE @retainedHeapSize > 10000000
+```
+
+### Memory Leak Hunting Methodology
+
+**Pattern: Multiple dumps over time**
+```bash
+# Baseline
+jmap -dump:live,format=b,file=heap1.hprof PID
+# Wait (1 hour, or N requests)
+jmap -dump:live,format=b,file=heap2.hprof PID
+# Wait more
+jmap -dump:live,format=b,file=heap3.hprof PID
+
+# In MAT: Compare histograms
+# Objects/retained growing over dumps = leak candidates
+```
+
+**Common leak patterns:**
+1. **Collection leak** - Map/List growing unbounded (caches without eviction)
+2. **Listener leak** - Registered callbacks never unregistered
+3. **ThreadLocal leak** - ThreadLocal values surviving thread pool reuse
+4. **Classloader leak** - Classes not unloaded (web app redeployment)
+5. **Native memory leak** - DirectByteBuffer, JNI, off-heap
+
+**Classloader leak detection:**
+```bash
+# Count loaded classes over time
+jstat -class PID 1000 | awk '{print $1}'  # Should stabilize
+
+# Find classloader retained size
+jcmd PID GC.class_stats | head -50
+
+# In MAT: Group by classloader
+# Multiple instances of same webapp classes = leak
+```
+
+### Direct Memory / Off-Heap Leak Detection
+
+When RSS >> (Heap + Metaspace), suspect off-heap memory.
+
+```bash
+# Check direct buffer pool
+jcmd PID VM.native_memory summary | grep -A5 "Internal"
+
+# Track over time
+jcmd PID VM.native_memory baseline
+# ... wait ...
+jcmd PID VM.native_memory summary.diff
+# Growing categories = leak
+
+# Java-level direct buffer tracking
+jcmd PID VM.info | grep "Direct Memory"
+```
+
+**Netty ByteBuf leak detection:**
+```bash
+# Enable Netty leak detection
+-Dio.netty.leakDetection.level=paranoid
+# Levels: disabled, simple, advanced, paranoid
+
+# Check Netty metrics
+curl http://localhost:8080/actuator/metrics/netty.allocator.direct.memory.used
 ```
 
 ### OOM Handling
@@ -434,7 +815,114 @@ jcmd PID VM.native_memory summary.diff  # Compare to baseline
 -XX:LargePageSizeInBytes=2m
 ```
 
-## JIT Tuning
+## JIT Internals & Tuning
+
+### Tiered Compilation Levels
+
+| Level | Compiler | Description |
+|-------|----------|-------------|
+| 0 | Interpreter | No compilation |
+| 1 | C1 | Simple compilation, no profiling |
+| 2 | C1 | Limited profiling |
+| 3 | C1 | Full profiling (default entry) |
+| 4 | C2 | Optimized compilation (target) |
+
+```bash
+# Print compilation with levels
+-XX:+PrintCompilation
+# Output: timestamp compile_id attributes tiered_level method size
+
+# C1 only mode (faster startup, lower peak)
+-XX:TieredStopAtLevel=1
+
+# Reserved code cache (segmented in JDK 9+)
+-XX:ReservedCodeCacheSize=512m
+-XX:NonProfiledCodeHeapSize=100m   # Non-profiled methods
+-XX:ProfiledCodeHeapSize=300m      # Profiled methods (largest)
+-XX:NonMethodCodeHeapSize=8m       # JVM internal code
+```
+
+### Warmup Verification
+
+```bash
+# Confirm JIT compilation is complete
+-XX:+PrintCompilation 2>&1 | grep -c "made not entrant"
+# Count should stabilize when warm
+
+# Watch compilation queue drain
+jcmd PID Compiler.queue
+# Empty queue = compilation caught up
+
+# Typical warmup pattern: run 10-50k requests before benchmarking
+```
+
+### Deoptimization
+
+Deoptimization discards compiled code and returns to interpreter. Common causes:
+- Type speculation failure (unexpected class)
+- Null check elimination failure
+- Array bounds speculation failure
+
+```bash
+# Track deoptimization events
+-XX:+UnlockDiagnosticVMOptions -XX:+TraceDeoptimization
+
+# JFR deoptimization events
+jfr print --events jdk.Deoptimization recording.jfr
+```
+
+### JITWatch
+
+Visualize JIT compilation decisions, inlining trees, and assembly.
+
+```bash
+# Generate compilation logs
+java -XX:+UnlockDiagnosticVMOptions \
+     -XX:+LogCompilation \
+     -XX:LogFile=compilation.log \
+     -jar app.jar
+
+# Download and run JITWatch
+git clone https://github.com/AdoptOpenJDK/jitwatch
+cd jitwatch && mvn clean install -DskipTests
+./launchUI.sh
+
+# Load compilation.log in JITWatch for:
+# - Inlining tree visualization
+# - TriView: source → bytecode → assembly
+# - Method compilation timeline
+```
+
+**Common inlining failures:**
+- "callee is too large" - method bytecode > 35 bytes (default)
+- "too big" - cumulative inlined size limit
+- "hot method too big" - C2 won't inline
+- "call site not reached" - never executed path
+
+```bash
+# Increase inlining limits (use with caution)
+-XX:MaxInlineSize=50              # Default: 35
+-XX:FreqInlineSize=400            # Default: 325 (hot methods)
+```
+
+### PrintAssembly (hsdis)
+
+View generated machine code. Requires hsdis library.
+
+```bash
+# Install hsdis (Debian/Ubuntu)
+# Download from https://chriswhocodes.com/hsdis/ or build from OpenJDK
+
+# Print assembly for specific method
+-XX:+UnlockDiagnosticVMOptions \
+-XX:+PrintAssembly \
+-XX:PrintAssemblyOptions=intel \
+-XX:CompileCommand=print,*MyClass.myMethod
+
+# Or use JITWatch TriView for visual assembly inspection
+```
+
+### Basic JIT Flags
 
 ```bash
 # Print compilation
@@ -442,10 +930,6 @@ jcmd PID VM.native_memory summary.diff  # Compare to baseline
 
 # Tiered compilation (default)
 -XX:+TieredCompilation
-
-# Reserved code cache
--XX:ReservedCodeCacheSize=512m     # Increase for large apps
--XX:InitialCodeCacheSize=64m
 
 # Print inlining decisions
 -XX:+UnlockDiagnosticVMOptions -XX:+PrintInlining
@@ -839,6 +1323,116 @@ jlink --add-modules java.base,java.logging \
 
 **Size reduction:** Custom runtimes can be 50%+ smaller than full JDK.
 
+## JMH (Java Microbenchmark Harness)
+
+JMH is the standard for reliable Java microbenchmarks. Essential for performance work.
+
+### Setup
+
+```xml
+<!-- Maven -->
+<dependency>
+    <groupId>org.openjdk.jmh</groupId>
+    <artifactId>jmh-core</artifactId>
+    <version>1.37</version>
+</dependency>
+<dependency>
+    <groupId>org.openjdk.jmh</groupId>
+    <artifactId>jmh-generator-annprocess</artifactId>
+    <version>1.37</version>
+</dependency>
+```
+
+### Basic Benchmark
+
+```java
+@BenchmarkMode(Mode.AverageTime)
+@OutputTimeUnit(TimeUnit.NANOSECONDS)
+@State(Scope.Benchmark)
+@Fork(2)
+@Warmup(iterations = 5, time = 1)
+@Measurement(iterations = 5, time = 1)
+public class MyBenchmark {
+
+    private List<Integer> list;
+
+    @Setup
+    public void setup() {
+        list = new ArrayList<>();
+        for (int i = 0; i < 1000; i++) list.add(i);
+    }
+
+    @Benchmark
+    public int sumIterator() {
+        int sum = 0;
+        for (Integer i : list) sum += i;
+        return sum;  // Return to prevent dead code elimination
+    }
+
+    @Benchmark
+    public int sumStream() {
+        return list.stream().mapToInt(i -> i).sum();
+    }
+}
+```
+
+### Running Benchmarks
+
+```bash
+# Build and run
+mvn clean package
+java -jar target/benchmarks.jar
+
+# With specific benchmarks
+java -jar target/benchmarks.jar ".*sumIterator.*"
+
+# With profilers
+java -jar target/benchmarks.jar -prof gc       # GC stats
+java -jar target/benchmarks.jar -prof async    # async-profiler flame graph
+java -jar target/benchmarks.jar -prof perfnorm # Normalized perf counters
+```
+
+### Common Pitfalls
+
+```java
+// WRONG: JIT eliminates this (dead code)
+@Benchmark
+public void wrong() {
+    Math.sqrt(x);  // Result unused - optimized away
+}
+
+// RIGHT: Return result or use Blackhole
+@Benchmark
+public double right() {
+    return Math.sqrt(x);
+}
+
+@Benchmark
+public void rightBlackhole(Blackhole bh) {
+    bh.consume(Math.sqrt(x));
+}
+
+// WRONG: Constant folding
+private final double x = 100;
+
+@Benchmark
+public double wrong() {
+    return Math.sqrt(100);  // Computed at compile time
+}
+
+// RIGHT: @State prevents constant folding
+@State(Scope.Benchmark)
+public class MyBenchmark {
+    double x = 100;  // Not final
+}
+```
+
+**JMH benchmark modes:**
+- `Throughput` - ops/time
+- `AverageTime` - avg time/op
+- `SampleTime` - time distribution
+- `SingleShotTime` - cold start time
+
 ## Container-Specific Tuning
 
 Modern JVMs (10+) detect container limits automatically.
@@ -860,6 +1454,83 @@ java -XshowSettings:system
 -XX:+ExitOnOutOfMemoryError       # Let orchestrator restart
 -XX:+HeapDumpOnOutOfMemoryError
 -XX:HeapDumpPath=/tmp/            # Writable location
+```
+
+### Container CPU Throttling
+
+**The invisible latency killer.** Your container gets throttled but JVM doesn't know.
+
+```bash
+# Check if you're being throttled (inside container)
+cat /sys/fs/cgroup/cpu.stat
+# nr_periods 12345
+# nr_throttled 1234       # > 0 = you're being throttled!
+# throttled_time 567890   # Nanoseconds spent throttled
+
+# Calculate throttle percentage
+awk '/nr_periods/ {p=$2} /nr_throttled/ {t=$2} END {print t/p*100 "%"}' /sys/fs/cgroup/cpu.stat
+```
+
+**Symptoms:** Latency spikes, p99 degradation, inconsistent response times despite low CPU in metrics.
+
+**Root cause:** cgroup CPU quota exhausted before period ends.
+
+```bash
+# Check quota settings
+cat /sys/fs/cgroup/cpu.max  # "100000 100000" = 1 CPU, quota period
+# First number: quota (microseconds)
+# Second: period (microseconds)
+# Ratio = effective CPUs
+
+# Kubernetes: requests vs limits mismatch
+# limits.cpu: 1000m = 100ms quota per 100ms period
+# If burst exceeds quota, throttling occurs
+```
+
+**Mitigations:**
+1. Increase CPU limits (more quota)
+2. Set requests = limits (guaranteed QoS)
+3. Use `ActiveProcessorCount` to align JVM thread pools
+4. Reduce parallelism (fewer threads contending for quota)
+
+```bash
+# Align JVM to container CPU limits
+-XX:ActiveProcessorCount=2        # Match your CPU limit
+# Prevents JVM from creating too many GC/compiler threads
+```
+
+### Container Memory: RSS vs Heap
+
+**OOMKilled vs Java OOM - different problems:**
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Java `OutOfMemoryError` | Heap exhausted | Increase `-Xmx` |
+| Container OOMKilled (137) | RSS > memory limit | Reduce heap, check native memory |
+
+```bash
+# What's using memory? (inside container)
+cat /proc/1/smaps_rollup
+# Or with NMT:
+jcmd 1 VM.native_memory summary
+
+# Common RSS contributors beyond heap:
+# - Metaspace (class metadata)
+# - Thread stacks (1MB default × threads)
+# - Code cache (JIT compiled code)
+# - Direct buffers (NIO, Netty)
+# - Native libraries (JNI)
+# - GC overhead
+```
+
+**Rule of thumb:** `memory.limit` should be `Xmx + 25-50%` for non-heap memory.
+
+```bash
+# Example for 4GB limit:
+-Xmx3g                            # Leave ~1GB for non-heap
+-XX:MaxMetaspaceSize=256m         # Bound metaspace
+-XX:ReservedCodeCacheSize=128m    # Bound code cache
+-XX:MaxDirectMemorySize=256m      # Bound direct buffers
 ```
 
 ### Container GC Recommendations
