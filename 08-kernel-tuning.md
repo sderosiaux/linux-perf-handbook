@@ -203,7 +203,7 @@ sysctl vm.numa_balancing=0
 ### Virtual Memory
 
 ```bash
-# Swappiness (0-100, lower = less swap)
+# Swappiness (0-200, lower = less swap; >100 prefers swap over file reclaim, kernel 5.8+)
 sysctl vm.swappiness=10                    # Desktop/DB
 sysctl vm.swappiness=1                     # Almost no swap
 

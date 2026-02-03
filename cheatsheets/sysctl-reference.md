@@ -67,7 +67,7 @@ Quick reference for common kernel parameters.
 
 | Parameter | Default | Tuned | Description |
 |-----------|---------|-------|-------------|
-| `vm.swappiness` | 60 | 10 | Swap tendency (0-100) |
+| `vm.swappiness` | 60 | 10 | Swap tendency (0-200, >100 prefers swap) |
 | `vm.vfs_cache_pressure` | 100 | 50 | Cache reclaim pressure |
 | `vm.dirty_ratio` | 20 | 15 | % RAM before sync write |
 | `vm.dirty_background_ratio` | 10 | 5 | % RAM before async write |

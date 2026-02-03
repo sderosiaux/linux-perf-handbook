@@ -1214,3 +1214,13 @@ This chapter synthesizes information from:
 - [Red Hat NUMA Performance Brief](https://access.redhat.com/sites/default/files/attachments/rhel7_numa_perf_brief.pdf)
 - [LWN.net: Taming the OOM Killer](https://lwn.net/Articles/317814/)
 - [systemd Memory Pressure Handling](https://systemd.io/MEMORY_PRESSURE/)
+
+---
+
+## See Also
+
+- [Java/JVM](10-java-jvm.md) - GC tuning, heap sizing, THP considerations for JVM
+- [Containers & K8s](07-containers-k8s.md) - cgroup memory limits, container OOM behavior
+- [Kernel Tuning](08-kernel-tuning.md) - vm.* sysctls, swappiness, dirty ratios
+- [Database Profiling](14-database-profiling.md) - shared_buffers, buffer pool sizing, page cache interaction
+- [Scheduler & Interrupts](16-scheduler-interrupts.md) - NUMA effects on scheduling, memory migration costs

@@ -832,6 +832,8 @@ cat /sys/fs/cgroup/<path>/io.pressure
 | `avg300` | 5-minute moving average | Trend analysis |
 | `total` | Accumulated microseconds | Historical tracking |
 
+> **Deep dive:** See [Memory Subsystem - PSI](15-memory-subsystem.md) for detailed PSI interpretation and thresholds.
+
 **PSI monitoring script:**
 ```bash
 #!/bin/bash
@@ -917,7 +919,7 @@ JVM defaults to 25% of container memory for heap (conservative for non-container
 # -XX:+UseContainerSupport  # Not needed anymore, defaults ON
 
 # Heap sizing - override the 25% default
--XX:MaxRAMPercentage=80.0  # Use 80% of container memory for heap
+-XX:MaxRAMPercentage=75.0  # Use 75% of container memory for heap (see Ch.10 for details)
 
 # Garbage collectors for containers
 -XX:+UseG1GC              # Default balanced GC
@@ -956,3 +958,13 @@ java -XX:AOTCache=app.aot -jar app.jar
 | Packet capture | `ksniff POD` |
 | Node capacity | `kube-capacity -p` |
 | cgroup usage | `systemd-cgtop` |
+
+---
+
+## See Also
+
+- [Memory Subsystem](15-memory-subsystem.md) - Page cache, OOM scoring, cgroup memory internals, THP in containers
+- [Scheduler & Interrupts](16-scheduler-interrupts.md) - CFS bandwidth throttling mechanics, CPU isolation
+- [eBPF & Tracing](06-ebpf-tracing.md) - Container-aware tracing, cgroup filtering
+- [Kernel Tuning](08-kernel-tuning.md) - cgroup-related sysctls, namespace settings
+- [Java/JVM](10-java-jvm.md) - Detailed JVM container tuning, heap sizing, GC selection

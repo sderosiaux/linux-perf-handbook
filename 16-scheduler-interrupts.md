@@ -1252,3 +1252,13 @@ Hard real-time with known WCET?
 - [sched_ext Schedulers - GitHub](https://github.com/sched-ext/scx)
 - [Interrupt Coalescing - Jakub Kicinski](https://people.kernel.org/kuba/easy-network-performance-wins-with-irq-coalescing)
 - [Understanding Interrupts and Softirqs - Netdata](https://www.netdata.cloud/blog/understanding-interrupts-softirqs-and-softnet-in-linux/)
+
+---
+
+## See Also
+
+- [eBPF & Tracing](06-ebpf-tracing.md) - runqlat, sched_ext custom schedulers, CPU tracing
+- [Containers & K8s](07-containers-k8s.md) - CFS bandwidth throttling detection, container CPU limits
+- [Kernel Tuning](08-kernel-tuning.md) - EEVDF tuning, sched_* sysctls, CPU governor
+- [Memory Subsystem](15-memory-subsystem.md) - NUMA memory placement, migration costs
+- [Latency Analysis](13-latency-analysis.md) - Scheduling latency impact on tail latency

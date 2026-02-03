@@ -1460,6 +1460,8 @@ java -XshowSettings:system
 
 **The invisible latency killer.** Your container gets throttled but JVM doesn't know.
 
+> **Deep dive:** See [Containers - CPU Throttling](07-containers-k8s.md) and [Scheduler - CFS Bandwidth](16-scheduler-interrupts.md) for comprehensive throttling diagnosis.
+
 ```bash
 # Check if you're being throttled (inside container)
 cat /sys/fs/cgroup/cpu.stat
@@ -1589,3 +1591,13 @@ jcmd 1 VM.native_memory summary
 -XX:MaxRAMPercentage=75.0
 -XX:+ExitOnOutOfMemoryError
 ```
+
+---
+
+## See Also
+
+- [Performance Profiling](05-performance-profiling.md) - async-profiler integration, flame graph interpretation
+- [Containers & K8s](07-containers-k8s.md) - Container sizing, cgroup limits, K8s resource requests
+- [Memory Subsystem](15-memory-subsystem.md) - THP impact on GC, NUMA-aware heap allocation, page faults
+- [Observability & Metrics](12-observability-metrics.md) - JMX metrics export, continuous profiling integration
+- [Latency Analysis](13-latency-analysis.md) - GC pause impact on tail latency, coordinated omission

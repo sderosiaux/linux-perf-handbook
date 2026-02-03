@@ -4,6 +4,30 @@ The entry point for performance debugging. Start here before diving into specifi
 
 ---
 
+## Reading Order
+
+### Foundations (Read First)
+1. **00-troubleshooting-framework** - Methodology (this chapter)
+2. **02-system-monitoring** - Basic tools (vmstat, iostat, mpstat)
+3. **05-performance-profiling** - perf fundamentals, flame graphs
+
+### Deep Dives (Topic-Specific)
+
+| Path | Chapters | Use Case |
+|------|----------|----------|
+| **Memory** | 15 → 10 → 14 | Memory issues, GC tuning, DB buffers |
+| **CPU** | 16 → 08 → 06 | Scheduling latency, CPU isolation, eBPF |
+| **Network** | 03 → 09 → 06 | Network analysis, tuning, XDP |
+| **Containers** | 07 (requires 15, 16) | K8s/Docker performance |
+| **Latency** | 13 → 05 → 12 | Tail latency, SLOs |
+
+### Advanced Topics
+- **06-ebpf-tracing** - After mastering perf (Ch.05)
+- **17-ftrace-production** - After eBPF (Ch.06)
+- **11-gpu-hpc** - Specialized workloads
+
+---
+
 ## 1. Methodology Overview
 
 Two complementary frameworks for systematic performance analysis.
