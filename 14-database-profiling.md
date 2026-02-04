@@ -2,6 +2,8 @@
 
 Query analysis, lock contention, buffer management, and storage engine internals.
 
+**See also:** [Database Production Debugging](database-production-debugging.md) for hot partition rate limiting, prepared statement cache pollution, memory-aware admission control, and victim vs culprit query identification.
+
 ## PostgreSQL
 
 ### Query Profiling

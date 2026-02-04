@@ -32,6 +32,26 @@ Symptom → 60-Second Analysis → Identify resource bottleneck → Deep dive ch
 | [09 - Network Tuning](09-network-tuning.md) | TCP, BBR, io_uring, NUMA networking |
 | [10 - Java/JVM](10-java-jvm.md) | JVM profiling and tuning |
 | [11 - GPU & HPC](11-gpu-hpc.md) | GPU profiling, MIG, HPC tracing |
+| [12 - Observability & Metrics](12-observability-metrics.md) | Prometheus, Grafana, OpenTelemetry |
+| [13 - Latency Analysis](13-latency-analysis.md) | Tail latency, coordinated omission, P99 |
+| [14 - Database Profiling](14-database-profiling.md) | PostgreSQL, MySQL, query optimization |
+| [Database Production Debugging](database-production-debugging.md) | Hot partitions, cache pollution, admission control, lock analysis |
+| [15 - Memory Subsystem](15-memory-subsystem.md) | NUMA, huge pages, memory profiling |
+| [16 - Scheduler & Interrupts](16-scheduler-interrupts.md) | CPU scheduling, context switching |
+| [Scheduler Debugging Deep Dive](scheduler-debugging-deep-dive.md) | CFS bugs, run queue attribution, Perfetto, noisy neighbor detection |
+| [17 - Ftrace Production](17-ftrace-production.md) | Function tracing, trace-cmd |
+| [18 - VDSO & Clock Source](18-vdso-clock-source-tuning.md) | Time syscalls, TSC, cloud VM performance |
+| [18 - Off-CPU Analysis](18-off-cpu-analysis.md) | Wall-clock profiling, blocking detection, load-scaling bottlenecks |
+
+### Advanced Topics & Production Patterns
+
+| Guide | Description |
+|-------|-------------|
+| [Coordinated Omission Guide](coordinated-omission-guide.md) | Load testing correctness, wrk2, timestamp injection |
+| [eBPF Performance Overhead](ebpf-performance-overhead-guide.md) | Hook overhead, map types, production deployment |
+| [Container Debugging Patterns](container-debugging-patterns.md) | cAdvisor, GOMAXPROCS, PSI, cgroup v2 debugging |
+| [TCP Edge Cases & Load Balancers](tcp-edge-cases-and-load-balancer-behavior.md) | SYN retry, LB buffering, timeout hierarchies |
+| [Bryan Cantrill Debugging Methodology](bryan-cantrill-debugging-methodology.md) | Questions-first, state preservation, systematic elimination |
 
 ### Cheatsheets
 
@@ -39,6 +59,7 @@ Symptom → 60-Second Analysis → Identify resource bottleneck → Deep dive ch
 |------------|-------------|
 | [One-Liners](cheatsheets/one-liners.md) | Quick diagnostic commands by problem type |
 | [Sysctl Reference](cheatsheets/sysctl-reference.md) | Key kernel parameters |
+| [VDSO/Clock Troubleshooting](cheatsheets/vdso-clock-troubleshooting.md) | Quick detection and fixes for time-related performance |
 
 ## 60-Second Analysis
 
