@@ -48,6 +48,7 @@ Symptom → 60-Second Analysis → Identify resource bottleneck → Deep dive ch
 
 | Guide | Description |
 |-------|-------------|
+| [CRDTs: Lock-Free Distributed State](crdt-lock-free-distributed-state.md) | G-Counter, PN-Counter, OR-Set, LWW-Register with delta sync |
 | [Coordinated Omission Guide](coordinated-omission-guide.md) | Load testing correctness, wrk2, timestamp injection |
 | [eBPF Performance Overhead](ebpf-performance-overhead-guide.md) | Hook overhead, map types, production deployment |
 | [Container Debugging Patterns](container-debugging-patterns.md) | cAdvisor, GOMAXPROCS, PSI, cgroup v2 debugging |

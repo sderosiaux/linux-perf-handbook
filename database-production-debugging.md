@@ -1375,6 +1375,12 @@ Transactions timing out or deadlocking?
 │       │       └── Implement statement timeout: SET statement_timeout = '30s'
 │       └── Monitor response_time_source metric
 │           └── High 'lock_wait' percentage → Focus on culprit optimization
+│
+└── Alternative: Lock-free architecture?
+    ├── Multi-datacenter writes with partition tolerance needed?
+    │   └── Consider CRDTs (see crdt-lock-free-distributed-state.md)
+    └── Counter/set operations dominating lock waits?
+        └── G-Counter, PN-Counter, OR-Set eliminate coordination
 ```
 
 ### 4. Prepared Statement Cache Pollution
@@ -1583,6 +1589,7 @@ One partition receiving disproportionate traffic?
 | **Execute time** | Time spent actually retrieving and processing data |
 | **Partition skew** | Imbalance in data distribution or access patterns across partitions |
 | **Response time attribution** | Decomposing total latency into constituent phases (parse, plan, lock wait, execute, network) |
+| **CRDT** | Conflict-free Replicated Data Type - lock-free data structures for distributed systems (see [CRDT guide](crdt-lock-free-distributed-state.md)) |
 
 ---
 

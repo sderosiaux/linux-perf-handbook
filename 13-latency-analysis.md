@@ -226,6 +226,8 @@ async-profiler -e lock -d 30 -f lock.html PID  # Java
 perf lock record -p PID && perf lock report    # Kernel
 ```
 
+**Lock-free alternative:** For distributed counters/sets where eventual consistency is acceptable, CRDTs eliminate coordination latency entirely. See [CRDT guide](crdt-lock-free-distributed-state.md).
+
 ## Queueing Theory Essentials
 
 ### Little's Law
