@@ -3,7 +3,7 @@
 Performance engineering, debugging, and system tuning reference.
 
 **Target Kernel:** Linux 6.6+ (EEVDF scheduler, modern eBPF features)
-**Last Updated:** 2024
+**Last Updated:** 2026-02
 
 ## How to Use This Handbook
 
@@ -42,6 +42,7 @@ Symptom → 60-Second Analysis → Identify resource bottleneck → Deep dive ch
 | [17 - Ftrace Production](17-ftrace-production.md) | Function tracing, trace-cmd |
 | [18 - VDSO & Clock Source](18-vdso-clock-source-tuning.md) | Time syscalls, TSC, cloud VM performance |
 | [18 - Off-CPU Analysis](18-off-cpu-analysis.md) | Wall-clock profiling, blocking detection, load-scaling bottlenecks |
+| [19 - Storage Engine Patterns](19-storage-engine-patterns.md) | LMDB, RocksDB, LSM, columnar, vectorized engines |
 
 ### Advanced Topics & Production Patterns
 
