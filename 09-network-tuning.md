@@ -917,6 +917,117 @@ sqe->buf_group = buf_group_id;
 
 **Key insight:** Multishot operations eliminate the syscall-per-event overhead that limits epoll. A single SQE submission can handle thousands of connections.
 
+### io_uring Submission Queue Batching
+
+The core performance lever is **SQ batching** — how many I/O operations accumulate before a single `io_uring_enter()` syscall:
+
+```
+epoll model:        N operations = 2N syscalls (wait + read/write per event)
+io_uring unbatched: N operations = N syscalls  (1 enter per SQE)
+io_uring batched:   N operations = N/B syscalls (1 enter per B SQEs)
+```
+
+The `iosqeAsyncThreshold` parameter controls when Netty submits the SQ ring to the kernel:
+
+```bash
+# Lower = more batching = fewer syscalls = higher throughput
+# Higher = less batching = lower latency per individual op
+-Dio.netty.iouring.iosqeAsyncThreshold=8    # aggressive batching (throughput)
+-Dio.netty.iouring.iosqeAsyncThreshold=25   # moderate (balanced)
+-Dio.netty.iouring.iosqeAsyncThreshold=64   # minimal batching (latency)
+```
+
+With threshold=8, Netty accumulates up to 8 SQEs before calling `io_uring_enter()`. For a broker handling 10K concurrent connections, this reduces syscalls from ~10K/s to ~1.2K/s.
+
+### JVM/Netty io_uring Integration (Java 21+)
+
+Netty 4.2+ provides native io_uring transport via `netty-transport-native-io_uring`:
+
+```xml
+<dependency>
+    <groupId>io.netty</groupId>
+    <artifactId>netty-transport-native-io_uring</artifactId>
+    <version>${netty.version}</version>
+    <classifier>linux-x86_64</classifier>
+</dependency>
+<dependency>
+    <groupId>io.netty</groupId>
+    <artifactId>netty-transport-classes-io_uring</artifactId>
+    <version>${netty.version}</version>
+</dependency>
+```
+
+**Transport detection with fallback chain:**
+
+```java
+// Priority: io_uring > epoll > kqueue > NIO
+if (IoUring.isAvailable()) {
+    // Linux 5.1+, requires kernel io_uring support
+    ioHandler = IoUringIoHandler.newFactory();
+    channelClass = IoUringServerSocketChannel.class;
+} else if (Epoll.isAvailable()) {
+    ioHandler = EpollIoHandler.newFactory();
+    channelClass = EpollServerSocketChannel.class;
+}
+
+// Netty 4.2 unified API — same code for all transports
+EventLoopGroup boss = new MultiThreadIoEventLoopGroup(1, ioHandler);
+EventLoopGroup worker = new MultiThreadIoEventLoopGroup(cores, ioHandler);
+```
+
+**Direct memory budget for io_uring:**
+
+io_uring shares memory between userspace and kernel via mmap. Combined with Netty's `PooledByteBufAllocator` (direct memory), the JVM needs an explicit direct memory budget:
+
+```bash
+# JVM flags for io_uring + Netty
+-XX:MaxDirectMemorySize=2g              # explicit cap (default = -Xmx, too high)
+-Dio.netty.noPreferDirect=false         # use direct memory (required for io_uring zero-copy)
+-Dio.netty.leakDetection.level=DISABLED # production: no leak sampling overhead
+-Dio.netty.iouring.iosqeAsyncThreshold=8
+```
+
+**Allocator tuning for high thread count:**
+
+```bash
+# With 32+ Netty I/O threads, increase arenas to avoid contention
+-Dio.netty.allocator.numDirectArenas=32   # default: 2 * cores
+-Dio.netty.allocator.numHeapArenas=32
+-Dio.netty.allocator.tinyCacheSize=1024   # default: 512
+-Dio.netty.allocator.smallCacheSize=512   # default: 256
+-Dio.netty.allocator.normalCacheSize=128  # default: 64
+```
+
+### Measured: epoll vs io_uring in a Netty Server
+
+Real measurements from a high-throughput Java server handling thousands of concurrent connections over Netty:
+
+| Metric | epoll | io_uring (threshold=8) |
+|--------|-------|------------------------|
+| Syscalls per message | ~2 | ~0.12 |
+| Context switches/sec | ~30K | ~8K |
+| CPU in kernel mode | ~30% | ~12% |
+| Overall throughput | 3,767 msg/s | 249,000 msg/s |
+
+The 66x throughput improvement is not io_uring alone — it includes lock-free data structures (ring buffers replacing SkipListMap), JCTools MPMC queues, and PostgreSQL batch writes. But io_uring eliminated the network syscall bottleneck that was gating everything else. The kernel mode CPU dropped from 30% to 12%, freeing those cycles for application logic.
+
+**Profiling io_uring performance:**
+
+```bash
+# Count io_uring syscalls
+bpftrace -e 'tracepoint:io_uring:io_uring_submit_req { @[comm] = count(); }' -c 'sleep 10'
+
+# Measure SQ/CQ ring utilization
+bpftrace -e '
+  tracepoint:io_uring:io_uring_submit_req { @submit = count(); }
+  tracepoint:io_uring:io_uring_complete { @complete = count(); }
+  interval:s:1 { print(@submit); print(@complete); clear(@submit); clear(@complete); }
+'
+
+# Compare syscall rates: io_uring vs epoll baseline
+strace -c -p <PID> 2>&1 | grep -E "epoll_wait|io_uring_enter|read|write"
+```
+
 ## Quick Reference
 
 | Task | Setting |

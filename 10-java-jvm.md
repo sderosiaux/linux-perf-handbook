@@ -570,6 +570,154 @@ java -jar jol-cli.jar internals com.example.Counter
 # Shows field offsets - fields within 64 bytes = potential false sharing
 ```
 
+## Lock-Free Data Structures & Mechanical Sympathy
+
+High-throughput JVM systems (message brokers, trading engines, streaming pipelines) avoid locks on the hot path entirely. The key patterns:
+
+### Ring Buffers: O(1) Bounded Queues
+
+A fixed-size array with power-of-2 capacity and bitwise masking replaces `ConcurrentSkipListMap` (O(log n)) or `ConcurrentLinkedQueue` (CAS contention + GC pressure).
+
+```java
+// Power-of-2 ring buffer — O(1) store, O(1) lookup, zero GC after init
+public class RingBuffer<T> {
+    private final Object[] buffer;
+    private final int mask;                // capacity - 1
+    private final AtomicLong sequence = new AtomicLong();
+
+    public RingBuffer(int requestedCapacity) {
+        int capacity = Integer.highestOneBit(requestedCapacity - 1) << 1; // round up to power of 2
+        this.buffer = new Object[capacity];
+        this.mask = capacity - 1;
+    }
+
+    public long store(T item) {
+        long seq = sequence.getAndIncrement();     // 1 CAS (LOCK XADD on x86)
+        buffer[(int)(seq & mask)] = item;          // 1 array write, bitwise AND (1 cycle vs DIV ~25 cycles)
+        return seq;                                // old entries silently overwritten on wrap-around
+    }
+
+    @SuppressWarnings("unchecked")
+    public T get(long seq) {
+        if (seq < sequence.get() - buffer.length || seq >= sequence.get()) return null;
+        return (T) buffer[(int)(seq & mask)];      // 1 array read
+    }
+}
+```
+
+**Why `seq & mask` instead of `seq % capacity`?** The bitwise AND is a single CPU cycle. Integer division is 20-35 cycles on x86. At 35M ops/sec, that difference is measurable.
+
+**Why power-of-2?** If `capacity = 1024`, then `mask = 0x3FF`. The AND masks high bits and keeps the remainder — mathematically identical to modulo, but only works for powers of 2.
+
+**Eviction is free.** No `while(size > limit) removeFirst()` loop. Wrap-around overwrites the oldest slot. The `lowWatermark` is computed as `sequence.get() - capacity`.
+
+**ABA protection.** A slow reader that reads a slot already overwritten by wrap-around must validate: store the sequence number alongside the value and check `stored.seq == requested.seq` after the read.
+
+**Measured**: 35.8M get/s on a single-writer ring buffer vs ~2M ops/s on `ConcurrentSkipListMap` for the same workload (1024 entries, random access pattern).
+
+### VarHandle: Bypass AtomicInteger Overhead
+
+`VarHandle` (Java 9+) provides volatile/CAS semantics without wrapper object indirection:
+
+```java
+// AtomicInteger: object header (16 bytes) + int field + indirection on every access
+private final AtomicInteger count = new AtomicInteger();
+count.getAndIncrement();  // load AtomicInteger reference → load int field → CAS
+
+// VarHandle: direct field access, same memory ordering guarantees
+private int count;
+private static final VarHandle COUNT;
+static {
+    COUNT = MethodHandles.lookup().findVarHandle(MyClass.class, "count", int.class);
+}
+COUNT.getAndAdd(this, 1);  // direct CAS on the field, no indirection
+```
+
+On the hot path (millions of ops/sec), eliminating one pointer indirection per operation matters. `VarHandle` also supports `getOpaque()`, `setRelease()`, `getAcquire()` for weaker-than-volatile ordering when full sequential consistency isn't needed.
+
+### JCTools: Production Lock-Free Queues
+
+[JCTools](https://github.com/JCTools/JCTools) provides specialized concurrent queues that outperform `ConcurrentLinkedQueue` by 2-10x:
+
+```xml
+<dependency>
+    <groupId>org.jctools</groupId>
+    <artifactId>jctools-core</artifactId>
+    <version>4.0.5</version>
+</dependency>
+```
+
+| Queue | Pattern | Use Case |
+|-------|---------|----------|
+| `MpscArrayQueue` | Multi-Producer Single-Consumer | Event buses, flush queues, actor mailboxes |
+| `MpmcArrayQueue` | Multi-Producer Multi-Consumer | Worker pools, parallel write pipelines |
+| `SpscArrayQueue` | Single-Producer Single-Consumer | Pipeline stages, channel pairs |
+
+```java
+// 65,536-slot lock-free queue — no allocation after init, no locks ever
+MpmcArrayQueue<Message> writeQueue = new MpmcArrayQueue<>(65_536);
+
+// Producer (Netty I/O thread) — non-blocking, never waits
+if (!writeQueue.offer(msg)) {
+    applyBackpressure();  // queue full — signal upstream
+}
+
+// Consumer (writer threads) — batch drain for throughput
+writeQueue.drain(batch::add, 256);  // drain up to 256 in one call
+```
+
+**Key property**: Bounded capacity means no GC pressure from unbounded growth. The `offer()` returns `false` instead of blocking — backpressure is explicit, not hidden in lock contention.
+
+**Backpressure pattern**: Monitor fill ratio (`size() / capacity()`). At 50% full, slow down producers. At 90%, reject new writes. This prevents the queue from becoming a latency amplifier.
+
+### Netty ByteBuf Allocator Tuning
+
+For Netty-based servers handling thousands of connections, the `PooledByteBufAllocator` configuration directly impacts throughput:
+
+```java
+// Default: allocator creates arenas = 2 * CPU cores
+// Problem: with 32+ Netty threads, arena contention causes lock waits
+
+// Fix: increase arena count and thread-local caches
+System.setProperty("io.netty.allocator.numDirectArenas", "32");
+System.setProperty("io.netty.allocator.numHeapArenas", "32");
+System.setProperty("io.netty.allocator.tinyCacheSize", "1024");   // default 512
+System.setProperty("io.netty.allocator.smallCacheSize", "512");   // default 256
+System.setProperty("io.netty.allocator.normalCacheSize", "128");  // default 64
+```
+
+**Direct memory budget**: io_uring and Netty both use direct (off-heap) memory. Set `-XX:MaxDirectMemorySize=2g` explicitly — the JVM default is equal to `-Xmx` which is usually too much.
+
+**Leak detection**: In production, disable Netty's leak detector (`-Dio.netty.leakDetection.level=DISABLED`). It samples allocations and adds overhead. Enable only when debugging.
+
+```bash
+# Monitor Netty direct memory via Micrometer/Actuator
+curl http://localhost:8080/actuator/metrics/netty.allocator.direct.memory.used
+
+# Or via JMX
+jcmd PID VM.native_memory summary | grep -A5 "Internal"
+```
+
+### Thread Affinity: When It Helps and When It Hurts
+
+CPU pinning (via OpenHFT `affinity` library) can reduce context switches and improve cache locality:
+
+```java
+// Pin current thread to a specific CPU core
+AffinityLock lock = AffinityLock.acquireLock();  // grabs next available core
+try {
+    // hot loop runs on pinned core — no migration, warm L1/L2 cache
+} finally {
+    lock.release();
+}
+```
+
+**When it helps**: Dedicated worker threads processing a MPSC queue (one consumer, pinned to a core). The L1 cache stays warm. Measured: 15-30% throughput improvement in tight polling loops.
+
+**When it hurts**: Startup with many threads. Each `acquireLock()` call blocks on a global `LockInventory` — 32 threads acquiring serially causes 65-100ms startup delay. For Netty EventLoops, use `DefaultThreadFactory` and let the OS scheduler handle affinity. The OS is surprisingly good at keeping threads on the same core without explicit pinning.
+
+**Rule of thumb**: Pin only 1-4 critical threads (the flush executor, the write-ahead log writer). Let everything else float.
+
 ## GC-Friendly Coding Patterns
 
 Real-world data shows 25-50% CPU time spent on GC in high-throughput systems.

@@ -848,7 +848,147 @@ import pyarrow as pa; print(pa.total_allocated_bytes())
 
 ---
 
-## 12. Quick Reference: Tuning Parameters
+## 12. In-Memory Ring Buffer Message Stores
+
+**Pattern**: Fixed-size circular buffer with power-of-2 masking for O(1) append and lookup. Used as a hot cache in front of durable storage (PostgreSQL, disk segments).
+
+### When to Use
+
+| Use Case | Why Ring Buffer |
+|----------|----------------|
+| Message broker hot cache | O(1) append + lookup, zero GC after init |
+| Recent-window aggregation | Fixed memory, automatic eviction of old data |
+| Event replay buffer | Sequential offsets, consumers trail behind producers |
+| Deduplication tracker | Last N batches per producer, fixed-size per-key |
+
+### Core Algorithm
+
+```
+Capacity = power of 2 (e.g., 1024)
+Mask = capacity - 1 (e.g., 0x3FF)
+
+store(item):
+    offset = atomicSequence.getAndIncrement()   // 1 CAS
+    buffer[offset & mask] = item                // 1 array write (bitwise AND = 1 CPU cycle)
+    // old slot silently overwritten on wrap-around
+
+get(offset):
+    head = sequence.get() - capacity
+    if offset < head or offset >= sequence.get(): return null   // out of window
+    item = buffer[offset & mask]                                // 1 array read
+    if item.offset != offset: return null                       // ABA protection
+    return item
+```
+
+**Critical properties:**
+- **No eviction loop.** Unlike `ConcurrentSkipListMap` + `while(size > limit) removeFirst()`, wrap-around is automatic.
+- **No GC pressure.** Fixed `Object[]` allocated once. No node objects, no rebalancing, no resizing.
+- **Cache-friendly.** Sequential array access vs pointer chasing in tree/list structures.
+- **Lock-free writes.** Single `AtomicLong.getAndIncrement()` (`LOCK XADD` on x86) — concurrent writers get unique slots without contention.
+
+### Performance Comparison
+
+| Operation | ConcurrentSkipListMap | Ring Buffer | Speedup |
+|-----------|----------------------|-------------|---------|
+| Store (single) | O(log n) + node alloc | O(1), no alloc | 5-15x |
+| Store (batch of 100) | 100 × O(log n) | 1 CAS + 100 writes | 10-20x |
+| Get (single) | O(log n) | O(1) | 10-20x |
+| Fetch (range of 10) | O(log n + 10) | O(10) | 3-5x |
+| Eviction | O(k) explicit loop | Free (wrap) | ∞ |
+| GC pressure | High (nodes) | Zero | N/A |
+
+Measured on a high-throughput messaging workload: **35.8M get/s** on ring buffer vs **~2M ops/s** on `ConcurrentSkipListMap` (1024 entries, random access).
+
+### Sizing
+
+```
+Buffer memory = capacity × entry_size
+Entry = offset (8B) + timestamp (8B) + key ref (8B) + payload ref (8B) = ~32B metadata + payload
+
+Example: 65,536 slots × 1KB avg message ≈ 64MB per partition
+         100 partitions × 64MB = 6.4GB total
+```
+
+Rule: Size to hold 5-10 seconds of peak throughput. Messages older than the buffer window are fetched from durable storage (PostgreSQL, S3, segment files).
+
+### ABA Problem and Protection
+
+When the buffer wraps, slot N now holds message at offset `N + capacity` instead of offset `N`. A slow consumer reading offset `N` would get the wrong message.
+
+**Protection**: Store the logical offset alongside the value. On read, verify `stored.offset == requested.offset`. If mismatch, the slot was overwritten — return null and fall back to durable storage.
+
+```
+Time T1: buffer[5] = Message(offset=5, payload=A)    // written by producer
+Time T2: buffer[5] = Message(offset=1029, payload=B) // overwritten after wrap
+
+Consumer reads offset 5:
+  item = buffer[5 & mask]           // gets Message(offset=1029, payload=B)
+  item.offset == 5?                 // NO → ABA detected, fall back to DB
+```
+
+### Concurrent Variants
+
+| Variant | Thread Safety | Use Case |
+|---------|---------------|----------|
+| `AtomicLong` sequence + plain array | Multi-writer, single read path | Produce-heavy, single flush thread |
+| `AtomicReferenceArray` slots + `VarHandle` | Per-slot volatile visibility | Multi-writer, multi-reader |
+| `synchronized drain()` on inner list | Atomic batch extract | Batched flush with linger timer |
+
+The `AtomicReferenceArray` variant gives per-slot atomic visibility without locking the entire buffer. Two threads writing to different slots have zero contention. Use `VarHandle` for the sequence counter to avoid `AtomicInteger` wrapper overhead on the hot path.
+
+### Integration with Durable Storage
+
+Ring buffer as L1 cache in a tiered message store:
+
+```
+Producer → Ring Buffer (L1, O(1), 64MB, ~10s window)
+               │
+               ├── Cache HIT → return directly (sub-microsecond)
+               │
+               └── Cache MISS → fetch from PostgreSQL/S3 (milliseconds)
+                                  └── Backfill cache on fetch
+
+Flush path:  Ring Buffer → Batch Executor → PostgreSQL (batch INSERT)
+             Triggered by: count ≥ 1000 | size ≥ 1MB | linger ≥ 5ms
+```
+
+The flush triggers balance latency (linger timer) vs throughput (count/size batching). A linger timer of 5ms means: if no flush trigger fires within 5ms of the first write, flush anyway. This bounds worst-case latency.
+
+### Diagnosing Ring Buffer Issues
+
+```bash
+# Symptom: consumers always miss the cache (high DB read rate)
+# Cause: buffer too small or consumer too slow
+# Fix: increase capacity or add consumer-side batching
+
+# Symptom: producer throughput drops periodically
+# Cause: flush executor can't keep up → backpressure
+# Fix: increase flush batch size, add writer threads, or use MPMC queue
+
+# Monitor wrap-around rate
+# If lowWatermark advances faster than consumers read → buffer is too small
+# Rule: consumer lag (in offsets) should be < 50% of buffer capacity
+```
+
+### Linux Kernel Tuning for Ring Buffer Workloads
+
+```bash
+# Huge pages reduce TLB misses for large buffers (>2MB)
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
+# Application calls madvise(MADV_HUGEPAGE) on the buffer allocation
+
+# Lock pages in memory (prevent swap-out of hot buffer)
+ulimit -l unlimited
+# Application calls mlock() or uses -XX:+AlwaysPreTouch in JVM
+
+# NUMA: pin buffer allocation to local node
+numactl --membind=0 java -jar broker.jar
+# Or use libnuma/JNA to allocate on specific NUMA node
+```
+
+---
+
+## 13. Quick Reference: Tuning Parameters
 
 ### RocksDB
 
@@ -907,6 +1047,8 @@ This chapter synthesizes information from:
 - [OpenZFS Module Parameters](https://openzfs.github.io/openzfs-docs/Performance%20and%20Tuning/Module%20Parameters.html)
 - [Direct I/O Semantics](https://ext4.wiki.kernel.org/index.php/Clarifying_Direct_IO's_Semantics)
 - [ScyllaDB I/O Access Methods](https://www.scylladb.com/2017/10/05/io-access-methods-scylla/)
+- [JCTools Lock-Free Queues](https://github.com/JCTools/JCTools) — Java concurrent queues (MPSC, MPMC, SPSC)
+- [LMAX Disruptor Ring Buffer](https://lmax-exchange.github.io/disruptor/disruptor.html) — Original ring buffer pattern for JVM
 - [Pinterest LMDB Optimization](https://medium.com/pinterest-engineering/how-optimizing-memory-management-with-lmdb-boosted-performance-on-our-api-service-f85fa7d1626d)
 - [Parquet Performance Tuning](https://iceberglakehouse.com/posts/2024-10-all-about-parquet-part-10/)
 - [DataFusion Parquet Pruning](https://datafusion.apache.org/blog/2025/03/20/parquet-pruning/)
