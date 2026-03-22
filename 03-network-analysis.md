@@ -187,6 +187,56 @@ whois example.com              # Domain info
 whois 8.8.8.8                  # IP info
 ```
 
+### DNS Production Debugging
+
+**Unbound resolver internals:**
+```bash
+# Check request list depth — high depth = upstream bottleneck
+unbound-control dump_requestlist 0   # thread 0
+# "iterator wait" entries = waiting on upstream resolver
+
+# Live stats
+unbound-control stats_noreset | grep -E "total\.|num\.queries|cache"
+
+# Flush cache for a specific domain
+unbound-control flush example.com
+
+# Check zone forwarding config
+unbound-control list_forwards
+```
+
+**AWS VPC resolver limit: 1,024 pps per ENI** — hitting this causes SERVFAIL storms.
+```bash
+# Count DNS packets hitting the VPC resolver per second
+iptables -I OUTPUT -d 169.254.169.253 -p udp --dport 53 -j NFLOG --nflog-group 1
+# Or just count:
+iptables -I OUTPUT -d 169.254.169.253 -p udp --dport 53
+
+# PTR (reverse DNS) lookups are a hidden multiplier — never in hot paths
+# Fix: local Unbound per node with per-zone forwarding splits the budget
+```
+
+**Rotating DNS packet captures (30-minute sliding window):**
+```bash
+tcpdump -n -tt -i any -W 30 -G 60 -w '%FT%T.pcap' port 53
+# 30 files × 60s = 30 minutes of history, always available post-incident
+```
+
+**Diagnose slow/failing resolution:**
+```bash
+# Trace full resolution path
+dig +trace example.com
+
+# Measure resolver latency
+dig +stats example.com | grep "Query time"
+
+# Test EDNS Client Subnet routing (DNS-based LB)
+dig +subnet=0/0 example.com @resolver
+dig +subnet=<client_subnet>/24 example.com @8.8.8.8
+```
+
+> See [Resilience Patterns](20-resilience-patterns.md) for DNS-based load balancing and the Stripe VPC resolver production failure case.
+
 ## Route Analysis
 
 ### mtr (better traceroute)

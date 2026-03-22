@@ -369,9 +369,62 @@ ORDER BY count DESC;
 -- IO:DataFileRead      - reading data from disk
 ```
 
-## MySQL
+## MySQL High Availability
 
-### Slow Query Analysis
+> Source: [GitHub - MySQL High Availability at GitHub](https://github.blog/2018-06-20-mysql-high-availability-at-github/)
+
+### Failover Stack
+
+```
+orchestrator (Raft consensus)
+     ↓  promotes replica, updates primary identity
+Consul KV  (primary identity store)
+     ↓  watched by load balancer
+GLB/HAProxy (Consul-backed backend pools, anycast)
+     ↓
+Application (connects via VIP — primary identity hidden)
+```
+
+**Why this works:**
+- Raft consensus prevents split-brain: an isolated DC cannot form quorum → cannot become leader → no conflicting failovers
+- Promotion + Consul update happen concurrently — primary accepts writes before replication tree is fully repaired (non-blocking)
+- HAProxy `hard-stop-after` cleans stale connections automatically on backend change
+- GLB rejects empty backend lists and falls back to last-known state if Consul unavailable
+
+### Replication Configuration
+
+```sql
+-- Semi-sync on local DC replicas only
+-- Semi-sync timeout: 500ms (reverts to async on timeout — never blocks writes indefinitely)
+SET GLOBAL rpl_semi_sync_master_timeout = 500;
+SET GLOBAL rpl_semi_sync_master_enabled = ON;
+
+-- Pseudo-GTID (always-on) for flexible topology repair after failover
+-- Injected by orchestrator, enables any replica to become new primary
+```
+
+### Failover Timing
+
+```
+detection + promotion + Consul update + GLB reload = 10–13s typical (up to 25s extreme)
+```
+
+**Pre-identification:** orchestrator identifies the promotion candidate *before* failure occurs. Reduces decision time during actual failover.
+
+### pt-heartbeat (replication lag monitoring)
+
+```bash
+# Monitor replication lag
+pt-heartbeat --monitor --host replica --daemonize
+
+# Check current lag
+pt-heartbeat --check --host replica
+
+# GitHub patch: tolerate read_only state transitions + crashes without manual restart
+# Critical: standard pt-heartbeat requires intervention after primary failover
+```
+
+### MySQL Slow Query Analysis
 
 #### slow_query_log
 

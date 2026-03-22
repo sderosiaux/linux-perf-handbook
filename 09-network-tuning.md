@@ -127,6 +127,31 @@ sysctl -w net.ipv4.tcp_tw_reuse=1
 sysctl -w net.ipv4.tcp_max_tw_buckets=1440000
 ```
 
+### SNAT + tcp_tw_recycle = Silent SYN Drops
+
+> Source: [eBay - VIP Connection Timeout Issue Caused by SNAT and tcp_tw_recycle](https://innovation.ebayinc.com/stories/a-vip-connection-timeout-issue-caused-by-snat-and-tcp-tw-recycle/)
+
+**`net.ipv4.tcp_tw_recycle=1` is dangerous behind any NAT/SNAT.** Removed from kernel 4.12.
+
+**Mechanism:** PAWS (Protection Against Wrapped Sequences) validates that incoming TCP timestamps are monotonically increasing per `(src_ip, dst_ip, src_port)` tuple. With SNAT, multiple real clients share one source IP — their clocks diverge. The server sees a lower TSval from a new client, silently drops the SYN packet. **No RST, no ICMP, just 15-second timeout.**
+
+```bash
+# Detect PAWS rejections (the smoking gun)
+netstat -s | grep -i paws
+# LINUX_MIB_PAWSPASSIVEREJECTED: N   ← growing = SNAT+recycle problem
+
+# Signature in tcpdump: SYN sent, no SYN-ACK, RST after timeout (~15s)
+tcpdump -n 'tcp[tcpflags] & tcp-syn != 0'
+
+# Check if tcp_tw_recycle is enabled
+sysctl net.ipv4.tcp_tw_recycle   # should be 0 or missing (kernel ≥ 4.12)
+
+# Fix
+sysctl -w net.ipv4.tcp_tw_recycle=0
+```
+
+**Rule:** `tcp_tw_recycle` is only safe on edge servers directly facing unNATted clients. Never enable it behind a load balancer, SNAT gateway, or any NAT device.
+
 ### Port Range
 
 ```bash
