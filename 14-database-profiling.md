@@ -1037,6 +1037,189 @@ Same principle applies to MongoDB: client-side LZ4_HIGH compression reduced oplo
 # This enables seamless codec switching and forward/backward compatibility
 ```
 
+## Cassandra
+
+### Partition Design Rules
+
+**The tombstone incident (Discord — 12 nodes, 1TB compressed/node):**
+```
+A Discord server deleted millions of messages, leaving 1 message in the channel.
+On next read: Cassandra scanned millions of tombstones.
+Result: JVM generated GC garbage faster than it could collect
+→ 10-second stop-the-world GC pauses, 20-second channel load times.
+
+Fix: track empty buckets per channel; skip them in the read path entirely.
+```
+
+**Partition key design:**
+```
+(channel_id, bucket)   ← time-derived integer (~10 days per bucket)
+                         caps partition size under 100 MB
+                         prevents GC pressure during compaction + rebalancing
+
+Clustering key: message_id (Snowflake/UUIDv1 — time-sortable)
+→ efficient descending range scans
+```
+
+**Never write null columns** — each skipped column generates a tombstone on reads. At high delete rates this compounds into GC pressure.
+
+### Key Config Parameters
+
+```yaml
+# Reduce tombstone accumulation window (default: 10 days)
+gc_grace_seconds: 172800   # 2 days — only safe if repair runs within this window
+
+# Repair must complete within gc_grace_seconds or deleted data can resurrect
+# on nodes that missed the delete (schedule nightly, off-peak)
+```
+
+### Compaction Strategy
+
+| Strategy | When to use | Tradeoff |
+|---|---|---|
+| **STCS** (default) | Write-heavy, sequential | Low write amplification; poor read latency |
+| **LCS** | Read-heavy, random | Predictable read latency; higher write I/O |
+| **TWCS** | Time-series (TTL-based) | Minimal compaction; requires uniform TTL |
+
+Yelp migrated ad analytics from STCS → LCS: **"vastly improved overall read performance"** by bounding the number of unmerged SSTables per read.
+
+```yaml
+compaction:
+  class: 'LeveledCompactionStrategy'
+  sstable_size_in_mb: 160
+```
+
+### Write Patterns
+
+```sql
+-- TTL: immutable per cell once written — plan upfront
+-- Changing TTL requires full re-insertion of all data
+
+-- UNLOGGED BATCH: safe only within same partition
+-- Cross-partition batches add coordinator overhead with zero benefit
+BEGIN UNLOGGED BATCH
+  INSERT INTO metrics (id, ts, val) VALUES (?, ?, ?);
+  INSERT INTO metrics (id, ts, val) VALUES (?, ?, ?);   -- same partition key
+APPLY BATCH;
+```
+
+```bash
+# Bulk historical ingest: bypass write path entirely
+# sstableloader — no GC pressure, no compaction spike
+sstableloader -d <seed_node> /path/to/sstables/keyspace/table/
+```
+
+**Yelp (ad analytics):** Batching writes reduced nightly batch job runtime by ~50%, network round-trips by ~10x.
+
+### Rolling Upgrade (Spotify — 3,000 nodes)
+
+```bash
+# NEVER take down more than one node per token range simultaneously → quorum loss
+
+# Per-node upgrade sequence (9 steps):
+nodetool clearsnapshot                          # 1. free disk space
+nodetool snapshot                               # 2. rollback snapshot
+puppet agent --disable "upgrading cassandra"    # 3. disable config mgmt
+systemctl stop cassandra                        # 4. stop
+# apply upgrade                                 # 5.
+systemctl start cassandra                       # 6. start
+# update system.schema_columnfamilies           # 7. format migration
+nodetool upgradesstables                        # 8. rewrite SSTables (HOURS per node)
+# remove rollback snapshot                      # 9.
+
+# Critical: nodetool upgradesstables can take hours
+# Never leave a cluster partially upgraded (cross-version breaks repair)
+```
+
+---
+
+## Elasticsearch
+
+### Shard Sizing
+
+```
+Target shard size: 20–50 GB  (eBay empirical: 150 GB index → 11 shards)
+Formula: shards = ceil(index_size_gb / target_shard_size_gb)
+
+< 1 GB          → 1 shard
+default/medium   → 5 shards (ES default)
+> 30 GB          → increase to split
+```
+
+Scale context (eBay): 60+ clusters, 2,000+ nodes, 18B documents/day ingested, 3.5B daily search requests.
+
+### Bulk Indexing Recipe
+
+```json
+PUT /my_index/_settings
+{
+  "index": {
+    "refresh_interval": "60s",
+    "number_of_replicas": 0,
+    "translog.durability": "async",
+    "translog.sync_interval": "30s"
+  }
+}
+```
+
+Post-load restore:
+```json
+{ "refresh_interval": "1s", "number_of_replicas": 1 }
+```
+
+Each replica during writes degrades throughput and increases latency linearly. Replicas=0 during bulk load, restore after indexing completes.
+
+### Query Optimization
+
+```
+Use filter context instead of query context when scoring irrelevant → cached
+Set "size": 0 on aggregation-only queries → engages shard query cache
+Use stored_fields to retrieve specific fields; avoid _source on large docs
+Sort by _doc instead of _score when ordering irrelevant → no score computation
+Avoid wildcard queries and leading wildcards entirely
+```
+
+```bash
+# Cache diagnostics
+GET index_name/_stats?filter_path=indices.***.query_cache
+GET index_name/_stats?filter_path=indices.***.request_cache
+# High miss rate (e.g. 46GB cache, 515K hits vs 1.07M misses) → cache key misconfiguration
+```
+
+### OS Settings
+
+```bash
+sysctl -w vm.swappiness=1          # not 0 — allows OOM killer to still function
+sysctl -w vm.max_map_count=262144  # ES refuses to start below this
+ulimit -n 65536
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+echo never > /sys/kernel/mm/transparent_hugepage/defrag
+```
+
+```ini
+# jvm.options: 50% of RAM, hard cap 26-30 GB (>32 GB = compressed OOPs disabled)
+-Xms26g
+-Xmx26g
+-XX:-HeapDumpOnOutOfMemoryError    # prevent disk exhaustion on OOM
+```
+
+### TSDB Compression — Facebook Beringei (Gorilla)
+
+**Scale:** 10B unique time series, 18M queries/minute.
+
+- **Timestamps:** delta-of-delta encoding (exploits fixed-interval regularity)
+- **Values:** XOR-based compression — XOR current vs previous, store only differing bits
+- **Result:** > 90% compression ratio (lossless)
+
+| Metric | Value |
+|---|---|
+| Write throughput (single machine) | 1.5M data points/sec |
+| Write-to-query availability | ~300 µs |
+| Read p95 latency | ~65 µs |
+| Hot retention (in-memory) | 24 hours |
+
+---
+
 ## Quick Reference
 
 | Task | PostgreSQL | MySQL |
