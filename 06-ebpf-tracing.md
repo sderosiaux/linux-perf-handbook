@@ -634,6 +634,54 @@ objs.PacketCount.Lookup(&key, &value)
 
 **Key insight:** Cilium uses eBPF to bypass iptables chain entirely - XDP programs hook before kernel network stack for near-line-rate policy enforcement.
 
+### Go + uprobes: Known Gotchas
+
+> Source: [Bumble Tech - BPF and Go](https://medium.com/bumble-tech/bpf-and-go-modern-forms-of-introspection-in-linux-6b9802682223)
+
+**uretprobes crash Go programs.** uretprobes work by rewriting the stack to insert a trampoline. Go's runtime does not expect stack modification — results in segfault.
+
+```bash
+# DON'T: attach uretprobe to Go binary
+bpftrace -e 'uretprobe:/usr/bin/mygoapp:main.handleRequest { printf("ret\n"); }'
+# → segfault in Go runtime
+
+# DO: attach uprobes at each function exit point manually
+bpftrace -e 'uprobe:/usr/bin/mygoapp:main.handleRequest { @start[tid] = nsecs; }
+             uprobe:/usr/bin/mygoapp:main.handleRequest+0x1a3 { @lat = hist(nsecs - @start[tid]); delete(@start[tid]); }'
+# Tedious but correct — find return offsets via objdump or go tool objdump
+go tool objdump -s 'main\.handleRequest' /usr/bin/mygoapp | grep RET
+```
+
+**Go ABI shift (1.17+): arguments moved from stack to registers.** BCC/bpftrace examples reading function args from stack offsets silently read garbage on Go 1.17+.
+
+```bash
+# Check Go ABI (register-based since 1.17)
+go version /usr/bin/mygoapp
+
+# For Go 1.17+: read args from registers, not stack
+# x86-64: arg0=rax, arg1=rbx, arg2=rcx, arg3=rdi (Go register ABI)
+bpftrace -e 'uprobe:/usr/bin/mygoapp:main.processRequest {
+    printf("arg0=%d arg1=%d\n", reg("ax"), reg("bx"));
+}'
+
+# Legacy stack-based (Go < 1.17) — arg at stack offset
+bpftrace -e 'uprobe:/usr/bin/mygoapp:main.processRequest {
+    printf("arg0=%d\n", *((int64*)sarg0));
+}'
+```
+
+**ELF debug info:** Go binaries include symbol/debug info even in optimized builds (unless stripped). Use ELF symbols for uprobe attachment without recompiling:
+```bash
+# List exported symbols
+nm /usr/bin/mygoapp | grep ' T '
+
+# Strip disables uprobe attachment by name:
+# go build -ldflags="-s -w"  ← stripped, use hex offset instead
+
+# High-frequency probes: aggregate in BPF map, emit only counts
+# Avoid per-event overhead for hot functions
+```
+
 ### Nix Development Environment
 
 Nix provides reproducible eBPF development environments with synchronized headers, compiler versions, and kernel configs.

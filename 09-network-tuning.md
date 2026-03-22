@@ -1043,6 +1043,144 @@ strace -c -p <PID> 2>&1 | grep -E "epoll_wait|io_uring_enter|read|write"
 | Set ring buffer | `ethtool -G eth0 rx 4096` |
 | Enable TSO | `ethtool -K eth0 tso on` |
 
+---
+
+## Brotli Compression
+
+> Sources: [LinkedIn](https://engineering.linkedin.com/blog/2017/05/boosting-site-speed-using-brotli-compression) · [Dropbox](https://dropbox.tech/infrastructure/deploying-brotli-for-static-content)
+
+Brotli delivers 20–30% better compression than gzip at equivalent decompression speed. Decompression is consistently faster than gzip across all quality levels.
+
+**Quality level selection:**
+| Content type | Quality | Rationale |
+|---|---|---|
+| Static assets (JS, CSS) | 11 (max) | Pre-compressed at build time, served from CDN |
+| Dynamic content | 4–5 | Fast enough for request-time compression |
+| API responses | gzip-6 | Brotli adds latency for small payloads |
+
+```bash
+# nginx: install ngx_brotli module
+# https://github.com/google/ngx_brotli
+
+# nginx.conf
+brotli on;
+brotli_static on;          # serve pre-compressed .br files
+brotli_comp_level 6;       # for dynamic content
+brotli_types text/plain text/css application/javascript application/json;
+
+# Pre-compress static assets at build time (quality 11):
+brotli -q 11 -o bundle.js.br bundle.js
+gzip -9 -k -o bundle.js.gz bundle.js   # keep gzip fallback
+```
+
+**CDN integration pitfalls:**
+- Many CDNs normalize `Accept-Encoding: br, gzip` to `gzip` when talking to origin — implement header normalization at CDN layer
+- Use normalized `Accept-Encoding` (not raw) as cache key discriminator to avoid Brotli/gzip cache fragmentation
+- Firefox 45.0.x ESR cannot decode Brotli with window < source file size — add UA blacklist in nginx config
+
+**Measured gains:**
+- Payload size: 20–30% smaller vs gzip-6 for JS/CSS; 25–31% for Cyrillic/Asian language packs
+- CDN CPU: ~15% reduction (serving pre-compressed vs runtime gzip)
+- Page load at P90: 2–3.6% improvement US, 6–6.5% improvement India (mobile > desktop)
+
+```bash
+# Verify Brotli is being served
+curl -sI -H "Accept-Encoding: br" https://example.com/bundle.js | grep -i content-encoding
+# Content-Encoding: br
+```
+
+---
+
+## nginx Production Tuning
+
+> Source: [Dropbox - Optimizing Web Servers for High Throughput and Low Latency](https://dropbox.tech/infrastructure/optimizing-web-servers-for-high-throughput-and-low-latency)
+
+```nginx
+# worker_processes auto;  # already covered in most configs
+worker_cpu_affinity auto;     # pin workers to CPUs
+
+# Async I/O via thread pools — up to 9x improvement for disk-heavy workloads
+aio threads;
+aio_write on;
+thread_pool default threads=32 queue_size=65536;
+
+# File descriptor cache — reduces stat(2) syscalls
+open_file_cache max=10000 inactive=60s;
+open_file_cache_min_uses 2;
+open_file_cache_errors on;
+open_file_cache_valid 30s;
+
+# PCRE JIT — faster regex matching for location blocks
+pcre_jit on;
+
+# Eliminate disk I/O from logging (syslog: non-blocking)
+access_log syslog:server=unix:/dev/log combined buffer=32k flush=5s;
+
+# Latency-sensitive routes: disable disk overflow buffering
+proxy_max_temp_file_size 0;
+
+# TLS optimization
+ssl_buffer_size 4k;           # 4k = latency-optimized (vs 16k for throughput)
+ssl_session_tickets on;
+ssl_stapling on;
+ssl_stapling_verify on;
+
+# Prefer ECDSA certs: 10x faster handshake than RSA 2048
+# Never use RSA 4096 for latency-sensitive endpoints
+# ssl_certificate /path/to/ecdsa_cert.pem;
+# ssl_certificate_key /path/to/ecdsa_key.pem;
+
+# Cipher selection:
+# - AES-128-GCM for servers with AES-NI
+# - ChaCha20-Poly1305 for mobile clients without hardware AES
+ssl_ciphers 'ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305';
+ssl_prefer_server_ciphers off;  # let client pick (respects mobile preference)
+```
+
+**Critical TCP parameters for HTTP/2 and long-lived connections:**
+```bash
+# Disable slow start after idle — critical for HTTP/2 multiplexing
+# Without this: cold streams after a period of idle get throttled by TCP slow start
+sysctl net.ipv4.tcp_slow_start_after_idle=0
+
+# ICMP black hole mitigation (path MTU discovery)
+sysctl net.ipv4.tcp_mtu_probing=1
+
+# HTTP/2 priority correctness (QUIC/HTTP3 buffer control)
+sysctl net.ipv4.tcp_notsent_lowat=16384
+
+# Unsafe settings to AVOID:
+# tcp_tw_recycle=1  → broken with NAT (any LB in front = broken)
+# tcp_timestamps=0  → breaks SACK on syncookies
+```
+
+**Profiling nginx in production:**
+```bash
+# Scheduler queue latency — source of multi-ms tail latency spikes
+runqlat
+
+# Slow file operations (> 10ms)
+fileslower 10
+
+# File open patterns (find unnecessary stat calls)
+opensnoop -n nginx
+
+# Per-connection TCP metrics
+ss -n --extended --info | grep -A1 "dport 443"
+
+# NUMA hit/miss rates
+numastat -n -c
+```
+
+**FQ + CUBIC: 15–20% packet loss reduction under burst:**
+```bash
+# Replace default pfifo_fast with Fair Queueing
+tc qdisc replace dev eth0 root fq
+
+# Tune CUBIC Hystart (slow start detection sensitivity)
+echo 2 > /sys/module/tcp_cubic/parameters/hystart_detect
+```
+
 ## See Also
 
 - [eBPF & Tracing](06-ebpf-tracing.md) - XDP, netkit, BPF networking

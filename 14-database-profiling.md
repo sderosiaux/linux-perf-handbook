@@ -872,6 +872,118 @@ mysqladmin -u root -p extended-status | grep -i buffer
 smem -tk -c "pid user command swap uss pss rss" | grep -E "postgres|mysql"
 ```
 
+## Redis
+
+### Client-Side Compression for Large Values
+
+> Source: [DoorDash - Speeding Up Redis with Compression](https://doordash.engineering/2019/01/02/speeding-up-redis-with-compression/)
+
+**Problem:** Large Redis values (>10KB) cause network congestion and high p99 latency at peak load. A single restaurant menu at 500KB generates significant oplog/replica traffic.
+
+**Solution:** Compress values client-side before writing to Redis. Decompress on read. Zero Redis config change.
+
+**Algorithm comparison for JSON payloads:**
+
+| Algorithm | Compression ratio | Decompression speed | Use case |
+|---|---|---|---|
+| LZ4 | 38–40% of original | **Fastest** (2x over Snappy) | Production default |
+| Snappy | 39–41% of original | Fast | Alternative |
+| Zlib/Brotli | 15–25% of original | Slow | Reject for caching |
+
+```python
+# Python example: compress above threshold
+import lz4.frame
+
+COMPRESS_THRESHOLD = 10_000  # bytes
+
+def redis_set(key, value):
+    raw = json.dumps(value).encode()
+    if len(raw) > COMPRESS_THRESHOLD:
+        data = b'\x01' + lz4.frame.compress(raw)  # prefix byte = compressed
+    else:
+        data = b'\x00' + raw
+    r.set(key, data)
+
+def redis_get(key):
+    data = r.get(key)
+    if data[0] == 1:
+        return json.loads(lz4.frame.decompress(data[1:]))
+    return json.loads(data[1:])
+```
+
+```bash
+# Benchmark compression algorithms on your actual data
+# lzbench: https://github.com/inikep/lzbench
+lzbench -t2,2 -b16 sample_payload.json
+
+# Results format: algorithm, compression ratio, compress MB/s, decompress MB/s
+```
+
+**DoorDash results:** p99 latency dropped, Redis memory also reduced (compress-before-write benefits both network and memory simultaneously).
+
+---
+
+### Active Key Expiration Tuning
+
+> Source: [Twitter/X Engineering - Improving Key Expiration in Redis](https://blog.x.com/engineering/en_us/topics/infrastructure/2019/improving-key-expiration-in-redis)
+
+**Redis active expiration** runs via `activeExpireCycle` on a timer (several times/second). It samples N random keys with TTL per database, deletes expired ones, and repeats if >25% were expired. Default sample size: 20 keys/loop.
+
+**Problem:** At Twitter scale (millions of keys, many databases per instance), 20 samples/loop is insufficient — expired keys accumulate, inflating memory and causing unexpected evictions.
+
+**Symptoms:**
+- Memory usage doesn't align with expected key count
+- Unexpected key evictions causing cache misses
+- Latency increases when Redis must evict before accepting writes
+- `SCAN` over all keys temporarily fixes memory (triggers passive expiration)
+
+**Diagnostic: check expired key overhead**
+```bash
+# Run a SCAN to force passive expiration, measure memory before/after
+redis-cli --latency-history -i 1
+redis-cli info memory | grep used_memory_human
+redis-cli scan 0 count 10000 > /dev/null   # triggers passive expiration
+redis-cli info memory | grep used_memory_human  # if drops significantly: expired keys accumulated
+
+# Monitor active expiration stats
+redis-cli info stats | grep expired_keys
+redis-cli info stats | grep evicted_keys
+
+# Check keyspace (how many DBs, how many keys per DB)
+redis-cli info keyspace
+```
+
+**Tuning `ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP`** (Redis 3.2+):
+```bash
+# In redis.conf or at runtime (requires recompile for static config)
+# Default: 20 — increase for dense keyspaces with many TTL keys
+# Higher = more expired keys found, but higher latency
+
+# Twitter tested: 200, 300, 500 — found 25% overhead of expired keys
+# Tradeoff: 500 reduced memory 25% but pushed P99.9 latency up significantly
+# 200 was a reasonable middle ground for their workload
+```
+
+**Redis version regression (2.4 → 3.2):** Version 3.2 introduced `CRON_DBS_PER_CALL` — a limit on max databases checked per expiration cycle. With many shards-as-databases, this caused expiration to miss most databases each cycle. Fix: configure or patch `CRON_DBS_PER_CALL` to match actual DB count.
+
+**MongoDB oplog compression** (related — eBay case):
+
+> Source: [eBay - Shopping Cart Compression](https://innovation.ebayinc.com/stories/how-ebays-shopping-cart-used-compression-techniques-to-solve-network-io-bottlenecks/)
+
+Same principle applies to MongoDB: client-side LZ4_HIGH compression reduced oplog from **150GB/hour → 11GB/hour** (13x) and average document size from **32KB → 5KB** (6x).
+
+```
+# Rollout pattern for zero-downtime compression migration:
+# Phase 1: DUAL write mode — write both compressed and uncompressed
+# Phase 2: verify compressed reads on canary
+# Phase 3: COMPRESS_ONLY mode — write compressed, read compressed
+# Phase 4: cleanup old uncompressed fields
+
+# Always store codec name + sizes in document metadata:
+# { "codec": "LZ4_HIGH", "compressedSize": 3095, "uncompressedSize": 6485 }
+# This enables seamless codec switching and forward/backward compatibility
+```
+
 ## Quick Reference
 
 | Task | PostgreSQL | MySQL |

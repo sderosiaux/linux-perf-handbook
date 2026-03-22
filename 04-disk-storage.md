@@ -334,6 +334,58 @@ echo 4096 > /sys/block/sda/queue/read_ahead_kb
 echo 1024 > /sys/block/sda/queue/max_sectors_kb
 ```
 
+## Kernel Regression: ext4 + HDD Latency
+
+> Source: [LinkedIn Engineering - Fixing Linux Filesystem Performance Regressions](https://engineering.linkedin.com/blog/2020/fixing-linux-filesystem-performance-regressions)
+
+**ext4 on rotating HDD suffers severe P99 latency on kernels 4.5–5.6.** Root cause: commits introduced in kernel 4.6 added extra journal operations on reads. XFS and NVMe are unaffected.
+
+**Diagnosis flow:**
+```bash
+# 1. Dump all CPU stack traces to dmesg (identify where threads are blocking)
+echo l > /proc/sysrq-trigger
+dmesg | tail -100
+
+# 2. Profile hot kernel paths
+perf top -a
+perf record -ag -- sleep 30 && perf report --no-children
+
+# 3. Reproduce with controlled I/O workload
+fio --name=seq-read --ioengine=psync --rw=read --bs=4k \
+    --numjobs=4 --size=1G --filename=/data/test --direct=1 --time_based --runtime=60
+
+# 4. Check active I/O scheduler — mq-deadline built as module may silently fall back to noop
+cat /sys/block/sda/queue/scheduler
+# Expected: [mq-deadline] kyber none
+# Problem:  [none]  ← module failed to load
+
+# Verify scheduler compile mode
+grep -E 'MQ_IOSCHED|IOSCHED' /boot/config-$(uname -r)
+# CONFIG_MQ_IOSCHED_DEADLINE=m  ← module (may not load)
+# CONFIG_MQ_IOSCHED_DEADLINE=y  ← built-in (always available)
+```
+
+**Fix options:**
+```bash
+# 1. Switch to mq-deadline (better tail latency for HDD)
+echo mq-deadline > /sys/block/sda/queue/scheduler
+
+# 2. Upgrade to kernel ≥ 5.7 (contains the fix)
+# Or cherry-pick: ext4: make dioread_nolock the default (commit e5da4c933)
+
+# 3. Migrate to XFS (not affected by the regression)
+# mkfs.xfs /dev/sdb && mount /dev/sdb /data
+
+# 4. Migrate to NVMe (bypasses the issue entirely)
+```
+
+**Quick check — is your system affected?**
+```bash
+uname -r   # 4.5 <= version <= 5.6 on HDD with ext4 → potentially affected
+df -T /data | awk '{print $2}'   # check filesystem type
+lsblk -d -o NAME,ROTA | grep " 1$"  # ROTA=1 = rotational (HDD)
+```
+
 ## Quick Reference
 
 | Task | Command |

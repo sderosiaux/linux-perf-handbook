@@ -475,6 +475,63 @@ pip install line_profiler
 kernprof -l -v script.py  # Functions with @profile decorator
 ```
 
+### vmprof (Flame Graphs for Python)
+
+> Source: [Yelp Engineering - 30x Performance on MySQLStreamer](https://engineeringblog.yelp.com/2018/02/making-30x-performance-improvements-on-yelps-mysqlstreamer.html)
+
+```bash
+pip install vmprof
+
+# In code: enable/disable around hot paths
+import vmprof, os
+
+fd = os.open("profile.vmprof", os.O_RDWR | os.O_CREAT | os.O_TRUNC)
+vmprof.enable(fd)
+# ... run workload ...
+vmprof.disable()
+os.close(fd)
+
+# Visualize: upload to https://vmprof.com or use vmprofshow CLI
+pip install vmprofshow
+vmprofshow profile.vmprof
+```
+
+**Production profiling methodology (Yelp):**
+
+1. **Profile on production, not staging** — memory leaks and traffic patterns differ significantly
+2. **Canary environment:** deploy new builds to a canary subscribed to production data but writing to separate outputs — iterate without risk
+3. **Saturate before profiling:** let the system fall behind (backlog builds up). Profiles taken in "unsaturated" state only show I/O waits, not CPU bottlenecks
+   ```bash
+   # Force saturation: stop the process for 30 min, restart, immediately profile
+   # Stop profiling just before the system catches up to real-time
+   ```
+4. **Understand expected hot paths first** — if profiler confirms them, stop. If it reveals surprises, fix those.
+
+**High-impact Python optimizations (by ROI):**
+
+```python
+# 1. LAZY DEBUG LOGGING — biggest win for log-heavy services
+# BAD: string formatting happens even when log level is INFO
+logger.debug("Processing: %s", expensive_object.__str__())  # always serializes
+
+# GOOD: skip formatting entirely when DEBUG is disabled
+if logger.isEnabledFor(logging.DEBUG):
+    logger.debug("Processing: %s", expensive_object)
+
+# Measured: 147ms → 1ms per 1000 iterations (100x speedup)
+
+# 2. BATCH I/O — increase batch sizes for network calls
+# Yelp: Kafka batch size 500 → 3000 = large throughput gain
+
+# 3. OPTIMIZE HOT PATHS — per-event code vs per-schema code
+# Code that runs on every message is worth 100x more to optimize than
+# code that runs once per schema change
+
+# 4. PyPy for CPU-bound Python services: 2-3x speedup vs CPython
+# Yelp ran 3 PyPy applications in production for 1.5 years without issues
+# Best for: pure Python, no C extensions incompatible with PyPy
+```
+
 ## Ruby Profilers
 
 ### rbspy

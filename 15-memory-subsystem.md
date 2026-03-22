@@ -1197,6 +1197,167 @@ kubectl exec -it <pod> -- cat /sys/fs/cgroup/memory.current
 
 ---
 
+## 11. Userspace Allocator Replacement
+
+> Source: [Zapier - Celery + jemalloc](https://zapier.com/engineering/celery-python-jemalloc/)
+
+**glibc's ptmalloc holds fragmented pages indefinitely.** For long-running Python/C++ services, fragmentation accumulates over hours causing memory to grow unbounded without actual leaks. jemalloc and tcmalloc actively return unused pages to the OS via `MADV_DONTNEED`.
+
+```bash
+# Replace malloc with jemalloc via LD_PRELOAD — zero code changes
+# Install:
+apt-get install libjemalloc-dev
+# Or build from source for latest:
+wget https://github.com/jemalloc/jemalloc/releases/download/5.3.0/jemalloc-5.3.0.tar.bz2
+tar xvjf jemalloc-5.3.0.tar.bz2 && cd jemalloc-5.3.0
+./configure && make && sudo make install
+
+# Use with any process:
+LD_PRELOAD=/usr/local/lib/libjemalloc.so celery worker --app=myapp
+LD_PRELOAD=/usr/local/lib/libjemalloc.so python myapp.py
+LD_PRELOAD=/usr/local/lib/libjemalloc.so gunicorn myapp:app
+
+# Works with: CPython, Gunicorn workers, uWSGI, any C/C++ service
+```
+
+**Benchmark results at Zapier (Celery workers):**
+- jemalloc 3.5.1: 30% RAM reduction (38.8 GB → 26.6 GB)
+- jemalloc 5.0.1: 40% reduction (→ 22.7 GB)
+
+```bash
+# Verify jemalloc is active
+LD_PRELOAD=/usr/local/lib/libjemalloc.so python -c "
+import ctypes
+lib = ctypes.CDLL(None)
+malloc_info = getattr(lib, 'malloc_stats_print', None)
+if malloc_info: malloc_info(None, None, None)
+"
+
+# jemalloc tunables via MALLOC_CONF env var:
+MALLOC_CONF="background_thread:true,metadata_thp:auto" LD_PRELOAD=... myapp
+# background_thread: async page return to OS
+# dirty_decay_ms:  time before returning dirty pages (default 10000ms)
+```
+
+**tcmalloc (Google) alternative:**
+```bash
+apt-get install libgoogle-perftools-dev
+LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libtcmalloc.so myapp
+```
+
+**Mental model:** Python's RSS grows not from leaks but from fragmented pages the allocator holds. Swapping is the OS response to idle-but-fragmented memory. Replacing the allocator solves this without code changes.
+
+---
+
+## 12. Python GC and fork()
+
+> Source: [Instagram Engineering - Copy-on-Write Friendly Python GC](https://instagram-engineering.com/copy-on-write-friendly-python-garbage-collection-ad6ed5233ddf)
+
+**Problem:** Django/Gunicorn with `fork()` is supposed to share memory via CoW with the parent. CPython's cyclic GC updates `ob_refcnt` fields on objects during collection, dirtying CoW pages and forcing private copies in every worker — negating the CoW savings.
+
+```python
+import gc
+import os
+
+# SOLUTION (Python 3.7+): gc.freeze() before forking
+# Moves all current objects to a permanent generation the GC never scans.
+# Child processes share these pages; GC only runs on new objects.
+gc.collect()   # collect any cycles first
+gc.freeze()    # freeze all surviving objects — GC won't touch them post-fork
+os.fork()      # pages stay shared in children
+
+# Verify frozen objects
+gc.get_freeze_count()  # number of frozen objects
+```
+
+**Alternative (more aggressive): disable cyclic GC in workers**
+```python
+# In Django/Gunicorn worker init (e.g., post_fork hook)
+import gc
+
+def post_fork(server, worker):
+    gc.disable()
+    # Run gc.collect() explicitly at safe points if needed
+    # or at periodic intervals between requests
+```
+
+**Tune GC thresholds for long-lived fork workers:**
+```python
+# Default: (700, 10, 10) — gen0, gen1, gen2 thresholds
+gc.get_threshold()
+
+# Delay gen2 (full) collection for workers that mostly process requests quickly
+gc.set_threshold(700, 10, 100)  # gen2 triggers less frequently
+
+# Gunicorn config (gunicorn.conf.py):
+def post_fork(server, worker):
+    gc.collect()
+    gc.freeze()
+```
+
+**Fleet-wide impact:** Reducing per-worker RSS by even 10–50 MB × thousands of workers = hundreds of GB of freed memory across a fleet.
+
+---
+
+## 13. Go GC Tuning
+
+> Source: [Twitch Engineering - Go Memory Ballast](https://blog.twitch.tv/go-memory-ballast-how-i-learnt-to-stop-worrying-and-love-the-heap-26c2462549a2)
+
+**Go's GC triggers when live heap doubles.** Small heaps → frequent GC → CPU overhead and goroutine suspension.
+
+**Modern approach (Go 1.19+): SetMemoryLimit**
+```go
+import "runtime/debug"
+
+func main() {
+    // Set soft memory limit — GC will run more aggressively to stay below this
+    // but won't OOM if briefly exceeded
+    debug.SetMemoryLimit(4 * 1024 * 1024 * 1024)  // 4 GB
+    // ... rest of app
+}
+```
+
+**Legacy approach: memory ballast (Go < 1.19)**
+```go
+func main() {
+    // Inflate heap baseline so GC triggers less often.
+    // The slice is never written to — OS maps virtual pages only (RSS stays low).
+    ballast := make([]byte, 10<<30)  // 10 GB virtual, ~0 RSS
+    _ = ballast
+    // ... rest of app
+}
+```
+
+**GOGC tuning:**
+```bash
+# GOGC=100 (default): GC when heap grows 100% above baseline
+# GOGC=400: GC when heap grows 400% — fewer cycles, higher peak memory
+GOGC=400 ./myapp
+
+# Disable GC entirely (use SetMemoryLimit instead for safety)
+GOGC=off ./myapp
+
+# Monitor GC behavior
+GODEBUG=gctrace=1 ./myapp
+# Output: gc N @Xs 0%: 0+0+0 ms clock, 0+0+0 ms cpu, N->N->N MB, N MB goal
+#                 ↑cpu%  ↑wall times              ↑heap sizes
+```
+
+**Key metrics to track:**
+```go
+var stats runtime.MemStats
+runtime.ReadMemStats(&stats)
+// stats.NumGC        — total GC cycles since start
+// stats.PauseNs      — ring buffer of pause durations (last 256)
+// stats.GCCPUFraction — fraction of CPU used by GC (target < 5%)
+// stats.HeapInuse    — heap in use
+// stats.HeapIdle     — heap mapped but idle
+```
+
+**Mental model:** GC pacing is proportional control. More headroom above live heap = fewer GC cycles = lower CPU overhead and fewer STW pauses. Use `SetMemoryLimit` to bound memory while letting GOGC control frequency.
+
+---
+
 ## Sources
 
 This chapter synthesizes information from:

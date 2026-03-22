@@ -259,6 +259,46 @@ try (var stream = new RecordingStream()) {
 }
 ```
 
+### Production Case: Virtual Thread Livelock (Netflix)
+
+> Source: [Netflix - Java 21 Virtual Threads: Dude, Where's My Lock?](https://netflixtechblog.com/java-21-virtual-threads-dude-wheres-my-lock-3052540e231d)
+
+**Pattern:** 4-vCPU host → 4 carrier threads. 4 VTs pinned (inside `synchronized`) + 1 VT unparked but no free carrier → **livelock**. Sockets accumulate in `CLOSE_WAIT`, JVM appears alive but serves nothing.
+
+**Root cause found:** Zipkin/Brave tracing — `RealSpan.finish()` entered a `synchronized` block, then inside called `CountBoundedQueue.offer()` which tried to acquire a `ReentrantLock`. The lock was in a released-but-unacquired state (`exclusiveOwnerThread=null`, `state=0`) that became permanent because no carrier was available to run the thread that should have acquired it.
+
+**Critical diagnosis tool: jcmd, not jstack**
+```bash
+# jstack misses virtual thread stacks in Java 21 — always use jcmd for VTs
+jcmd <pid> Thread.dump_to_file -format=json /tmp/threads.json
+
+# JSON output contains VT stacks; text format may omit them
+jcmd <pid> Thread.dump_to_file /tmp/threads.txt
+```
+
+**AQS lock field inspection via heap dump:**
+```bash
+# Capture heap dump to inspect AQS internal state
+jcmd <pid> GC.heap_dump /tmp/heap.hprof
+
+# In Eclipse MAT — OQL to find stuck locks:
+# SELECT * FROM java.util.concurrent.locks.AbstractQueuedSynchronizer
+#   WHERE exclusiveOwnerThread = null AND state != 0
+# OR inspect waiter node list for threads blocked with no owner
+
+# Also check: ReentrantLock instances where state=0 but waiter queue non-empty
+```
+
+**Audit before migrating to virtual threads:**
+```bash
+# Find synchronized methods in dependencies (tracing, metrics, logging libs)
+grep -r "synchronized" ~/.m2/repository/io/zipkin --include="*.java" | grep -v test
+# Or inspect bytecode:
+javap -c mylib.jar | grep -A2 "monitorenter"
+```
+
+**Fix:** Replace `synchronized` with `ReentrantLock` in library code. In JDK 24+, `synchronized` no longer pins (JEP 491 — rewritten internals).
+
 ### Structured Concurrency (Preview)
 
 Structured concurrency treats groups of related tasks as a unit. Preview in JDK 21-24, revised API in JDK 25.
@@ -349,12 +389,46 @@ var scope = StructuredTaskScope.open(Joiner.allSuccessfulOrThrow());
 ### G1GC Tuning
 ```bash
 -XX:+UseG1GC
--XX:MaxGCPauseMillis=200           # Target pause time
--XX:G1HeapRegionSize=16m           # Region size (1-32MB)
--XX:InitiatingHeapOccupancyPercent=45  # Start mixed GC
+-XX:MaxGCPauseMillis=200           # Target pause time (soft goal)
+-XX:G1HeapRegionSize=16m           # Region size (1-32MB, power of 2)
+-XX:InitiatingHeapOccupancyPercent=45  # Start mixed GC (lower for fast-growing old gen)
 -XX:G1ReservePercent=10            # Reserve for promotion
 -XX:G1NewSizePercent=5             # Min young gen %
 -XX:G1MaxNewSizePercent=60         # Max young gen %
+-XX:+AlwaysPreTouch                # Pre-fault heap pages at startup (avoids demand-paging spikes)
+-XX:+UseLargePages                 # Huge pages for heap + metaspace + JIT cache
+```
+
+**G1 Heap Sizing Rules (Atlassian):**
+```bash
+# Target: after full GC, used memory ≈ 1/3 of total heap
+# Max heap: 3-4x old generation live set
+# Old gen:  ≥ 1.5x old generation mean size
+# Young gen: ≥ 10% of total heap
+# Set -Xms = -Xmx to eliminate resizing overhead
+```
+
+**G1 Humongous Objects — avoid frequent large allocations:**
+```bash
+# Objects > 50% of G1HeapRegionSize are "Humongous" — allocated in old gen directly
+# This bypasses young gen and triggers concurrent marking cycles
+# With -XX:G1HeapRegionSize=16m, humongous threshold = 8MB
+
+# Detect humongous allocations:
+-Xlog:gc+humongous=debug
+
+# Fix: increase region size (max 32m) OR redesign to avoid large objects in hot paths
+# Common culprits: large byte[], String, HashMap backing arrays
+```
+
+**StringDeduplication — disable at large heaps:**
+```bash
+# StringDeduplication scans all live strings to find duplicates
+# At 100GB+ heap, scan overhead outweighs savings
+# Uber observed: disabling reduced GC time from 6.59% → 3% CPU at Presto scale
+
+-XX:-UseStringDeduplication    # Disable (check JVM default for your GC)
+# Enable only for heaps < 32GB with high String duplication (e.g., metric labels)
 ```
 
 ### GC Logging (Unified Logging)

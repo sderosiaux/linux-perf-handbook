@@ -944,6 +944,111 @@ java -XX:AOTCache=app.aot -jar app.jar
 
 **Key insight:** JVM heap is just one memory consumer. Account for metaspace, native memory, thread stacks, subprocesses, and Kubernetes probes when sizing container memory limits.
 
+---
+
+## CFS Throttle: The Silent Latency Killer
+
+> Source: [Indeed Engineering - Unthrottled](https://engineering.indeedblog.com/blog/2019/12/unthrottled-fixing-cpu-limits-in-the-cloud/)
+
+CFS cgroup bandwidth control throttles containers when they exhaust `cpu.cfs_quota_us` within a `cpu.cfs_period_us` window. A Linux kernel bug (commit `512ac999d275`, v4.18–v4.19) caused excessive throttling even at low actual CPU usage due to CFS period timer clock skew.
+
+**Symptom:** P99 spikes from 30ms → 2s with CPU utilization appearing normal in metrics.
+
+```bash
+# Diagnose throttling (inside container, cgroup v2)
+cat /sys/fs/cgroup/cpu.stat
+# nr_periods   12345
+# nr_throttled 4567    ← if >0 and CPU looks idle: kernel bug or tight limits
+# throttled_time 1234567890  ← nanoseconds
+
+# Throttle ratio: nr_throttled / nr_periods
+awk '/nr_periods/{p=$2} /nr_throttled/{t=$2} END{printf "%.1f%%\n", t/p*100}' \
+  /sys/fs/cgroup/cpu.stat
+
+# Check kernel version (bug present in 4.18-5.3 range)
+uname -r
+
+# Check quota/period
+cat /sys/fs/cgroup/cpu.max
+# "100000 100000" = 1 vCPU  |  "200000 100000" = 2 vCPUs
+```
+
+**Root cause check:** If `nr_throttled / nr_periods > 5%` while actual CPU utilization < 50%, the kernel bug is a likely culprit.
+
+**Fixes:**
+1. **Upgrade kernel** to ≥ 5.4 (fix backported)
+2. **Increase `cfs_period_us`** (reduces timer precision, avoids the race): set `cpu.cfs_period_us=50000` instead of default `100000`
+3. **Remove hard CPU limits** (`limits.cpu` in K8s) — use requests only if throttling is acceptable
+4. **Set requests = limits** for Guaranteed QoS to avoid quota exhaustion from bursts
+
+```bash
+# Kubernetes: check if hard limits are set
+kubectl get pod <pod> -o jsonpath='{.spec.containers[*].resources}'
+# Remove limits.cpu if latency is critical and nodes have headroom
+```
+
+---
+
+## Advanced CPU Isolation: LLC & NUMA
+
+> Source: [Netflix - Predictive CPU Isolation](https://netflixtechblog.com/netflix-techblog/predictive-cpu-isolation-of-containers-at-netflix-91f014d856c7)
+
+CPU utilization is a lagging and incomplete signal. A container at 30% CPU can be severely degraded by a neighbor's Last-Level Cache (LLC) pollution — containers share L3 cache ways even when pinned to different cores.
+
+**Detecting LLC interference:**
+```bash
+# Per-process LLC miss rate
+perf stat -e LLC-loads,LLC-load-misses,LLC-stores -p <pid> sleep 5
+
+# Intel RDT monitoring (kernel ≥ 4.10 + hardware support)
+pqos -m all:<core_list>
+
+# Scheduling delay (run time vs wait time)
+cat /proc/<pid>/schedstat
+# Field 1: nanoseconds on CPU
+# Field 2: nanoseconds waiting on runqueue  ← high = scheduler contention
+# Field 3: # times run on CPU
+```
+
+**CPU isolation via cpuset:**
+```bash
+# Pin container to specific physical cores (avoids cross-core cache thrashing)
+# In cgroup v2:
+echo "0-3" > /sys/fs/cgroup/<container>/cpuset.cpus
+echo "0" > /sys/fs/cgroup/<container>/cpuset.mems    # NUMA node 0
+
+# Verify NUMA topology first
+numactl --hardware
+lscpu | grep -E "NUMA|Socket|Core"
+```
+
+**Intel CAT (Cache Allocation Technology) — L3 cache partitioning:**
+```bash
+# Requires: kernel ≥ 4.10, Intel Broadwell/Skylake+, CONFIG_X86_CPU_RESCTRL=y
+mount -t resctrl resctrl /sys/fs/resctrl
+
+# List available cache ways
+cat /sys/fs/resctrl/info/L3/cbm_mask   # e.g., "3ff" = 10 ways
+
+# Create isolation groups
+mkdir /sys/fs/resctrl/latency_sensitive
+echo "0xff" > /sys/fs/resctrl/latency_sensitive/schemata  # 8 cache ways
+echo <pid> > /sys/fs/resctrl/latency_sensitive/tasks
+
+# Move batch workloads to fewer cache ways
+mkdir /sys/fs/resctrl/batch
+echo "0x3" > /sys/fs/resctrl/batch/schemata  # 2 cache ways
+```
+
+**Key mental model:** LLC contention causes IPC degradation invisible to CPU utilization metrics. Measure IPC alongside CPU% to detect noisy neighbors.
+
+```bash
+# IPC baseline: degradation signals cache pollution
+perf stat -e instructions,cycles -p <pid> sleep 5
+# IPC = instructions/cycles — expect ≥ 1.5 for compute-bound, ≥ 0.5 for memory-bound
+# Drop from baseline → cache/memory bandwidth pressure from neighbors
+```
+
 ## Quick Reference
 
 | Task | Command |
