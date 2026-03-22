@@ -396,6 +396,376 @@ Serving layer:
 
 ---
 
+---
+
+## SpinalTap — CDC at Airbnb
+
+**Guarantees:** at-least-once, zero data loss, sub-second propagation, per-row commit-order enforcement.
+
+### Architecture: 3-Layer Abstraction
+
+```
+Source: reads DB changelog (MySQL binlog, DynamoDB streams)
+        → filters/transforms to typed Mutation objects (insert/update/delete,
+          before/after values, transaction info, schema)
+
+Pipe:   unit of parallelism; coordinates source↔destination,
+        periodic checkpointing, lifecycle management, keep-alive/auto-recovery
+
+Destination: publishes to Kafka (Thrift wire format);
+             tracks last-published mutation for checkpoint derivation
+```
+
+**Cluster management:** Apache Helix — deterministic load balancing, horizontal scaling, Leader-Standby state model per source.
+
+**Split-brain mitigation:** global leader epoch per source, atomically incremented on leader transition. Clients filter mutations with stale epochs → discarded.
+
+**Throughput optimizations:**
+```
+Buffered Destination: in-memory bounded queue decouples source streaming from publish latency
+Destination Pool:     application-level partitioning across thread pool of buffered destinations
+                      handles spiky traffic without sacrificing ordering or consistency
+(Kafka strong consistency settings created a publish bottleneck — both patterns resolve it)
+```
+
+**Use cases:** cache invalidation (Memcached/Redis), real-time Elasticsearch indexing (review/inbox/support search), Hive/HBase snapshot pipeline (daily backup → hourly granularity), inter-service signaling (Availability Service subscribes to Reservation Service changes).
+
+---
+
+## Spark Partitioning Strategies (Airbnb)
+
+**Incident:** single job wrote 1.1 million files to HDFS → NameNode outage.
+- Root cause: 2000–3000 Spark partitions × 365 Hive date partitions = up to 1.1M files
+- HDFS cost: 150 bytes NameNode memory per file
+
+### Strategy Comparison
+
+| Strategy | When to use | Pitfall |
+|---|---|---|
+| `coalesce(N)` | Single hPartition, can cache | Pushdown to early stage unless cached |
+| `repartition(N)` | Single hPartition, round-robin | Useless for multi-hPartition |
+| `repartition(N, col)` | Multiple small hPartitions | HashPartitioner → 1 file/hPartition always |
+| `repartition(N, col, rand%k)` | Equal-size known hPartitions | Birthday Problem: 5 files×365 partitions → 63% executor utilization |
+| **`repartitionByRange(N, hash(cols), rand())`** | **Default for multi-hPartition** | Requires cache; driver needs 4–6 GB extra |
+
+**Recommended pattern:**
+```scala
+// Compute synthetic sort keys (infinite hash space → no Birthday Problem collisions)
+df.withColumn("_hash", hash(partitionColumns))
+  .withColumn("_rand", rand())
+  .repartitionByRange(fileCount, col("_hash"), col("_rand"))
+  .drop("_hash", "_rand")
+```
+
+File count upper bound: `fileCount + count(distinct hash)`.
+
+**File size heuristic:** target multiple of HDFS block size (128 MB). Use row-count estimation (count ÷ target rows/file) — compressed on-disk size ≠ in-heap size.
+
+---
+
+## TensorFlowOnSpark — Distributed TF on Spark/Hadoop Clusters (Yahoo)
+
+**Key design:** direct process-to-process tensor communication — unlike SparkNet/TensorFrame which route through the Spark driver (bottleneck).
+
+```
+Roles: TF workers + TF parameter servers each occupy one Spark executor
+Data: TensorFlow QueueRunners reading directly from HDFS (Spark = launcher only)
+     OR Spark RDD piped via feed_dict into TF computation graph
+Migration cost: fewer than 10 lines of Python changes for existing TF programs
+```
+
+**Scaling (Inception V3 to 0.730 top-5 accuracy):**
+
+| Workers | Time | Speedup |
+|---|---|---|
+| 1 | 46 hours | 1× |
+| 2 | 22.5 hours | 2.0× |
+| 4 | 13 hours | 3.5× |
+| 8 | 7.5 hours | **6.1× (near-linear)** |
+
+**RDMA optimization:**
+```
+Custom gRPC_RDMA protocol for Infiniband clusters
+Tensors allocated once at job start, reused across steps (zero-copy)
+VGG-19: significant speedup over gRPC (direct memory access bypasses Ethernet ceiling)
+```
+
+---
+
+## Netflix Media ML Platform
+
+**Problem:** multiple teams independently computing identical embeddings against the same assets → wasted compute, inconsistent results.
+
+### Amber Feature Store
+
+```
+Memoized feature store tied to media entities (videos, artwork)
+Each algorithm = "Amber Feature" with own scope for computation, storage, triggering
+Amber Features compose via dependency semantics → complex DAG of interrelated algorithms
+Recursive dependency resolution: algorithm pipelines triggered automatically when upstream changes
+Immutability + versioning + auditing + metrics on feature values
+Amber Compute: data replication to different backends per access pattern
+```
+
+**Match Cutting case study (cross-title video similarity):**
+```
+Single title:  ~2K shots → ~2M pair comparisons
+Series (10ep): 200M comparisons
+Cross-1000 files: ~200 trillion computations (naive pre-compute: 2^1000 — impossible)
+
+Solution: decompose into independent Amber Features
+  - Shot segmentation: computed once, memoized, shared as canonical dependency
+  - Embeddings: tied to shot deduplication, auto-triggered on standardized encode
+  - Pair computation: on-demand over pre-stored embeddings (avoids 2^N pre-computation)
+```
+
+### Training Performance
+
+```
+GPU cluster: Ray (multi-GPU, multi-node)
+Data loading: FSx (high-performance NFS)
+Preprocessing: offloaded to CPU instances (separate from GPU workers)
+Result: 3–5x increase in overall training system throughput
+```
+
+**Marken (serving + vector search):** annotations (versioned, strongly typed, associated with media entities). Supports temporal/spatial queries and vector search at catalog scale.
+
+---
+
+## Lyft ML Infrastructure
+
+### Feature Store
+
+**Scale:** several 1,000s of features, millions of requests/minute, single-digit ms latency, 99.99%+ availability.
+
+```
+Definition language: SQL (one column = entity ID; rest = features)
+Feature versions: per-feature versioning (not group-level) for faster iteration
+
+Ingestion:
+  Batch:     Flyte-scheduled SQL jobs against Hive warehouse
+  Streaming: custom Flink jobs with SQL-over-stream-windows
+
+Write path: validate → DynamoDB (latest value per feature per entity)
+            → replicate to Hive + Elasticsearch
+Read path:  Redis cache → DynamoDB on miss (no locking on read path)
+            Bulk batch-get: Redis → DynamoDB fallback
+Training:   replicated Hive tables queried directly (point-in-time reads, zero impact on online latency)
+```
+
+**Online-offline parity:** same SQL definition used for training and serving — same validations, same transformations. Eliminates training-serving skew.
+
+**Failure modes:**
+- Optimistic locking via DynamoDB conditional checks prevents stale writes from concurrent callers
+- Feature metadata includes per-feature alerting config (owning team paged on generation failure)
+- Hive replication is eventually consistent — accepted inconsistency window for ML workloads
+
+### Flyte — Cloud-Native ML Platform
+
+**Scale:** 7,000+ unique workflows, 100,000+ executions/month, 1 million tasks/month, 10 million containers/month.
+
+```
+Execution model: DAG-based, Kubernetes-native
+Task granularity: every task = its own container image (heterogeneous steps first-class)
+Strong typing on all task inputs/outputs → enables data lineage, parameterization, caching
+Every entity is immutable; changes = new explicit version (enables rollback + reproducibility)
+
+Task-level caching: if identical strongly-typed inputs already computed → output reused
+                    Eliminates redundant data prep across hyperparameter sweeps
+Backend plugins: extend task types via K8s CRDs (Spark-on-k8s, SageMaker, Qubole, BigQuery)
+Multi-tenant: each team has isolated repo, deploys independently
+```
+
+### LyftLearn — ML Training on Kubernetes
+
+**Scale:** hundreds of models/week, dozens of teams.
+
+```
+Notebook spin-up: seconds (K8s pod scheduling + image pull optimized)
+Auto-terminate idle notebooks: few hours (fast spin-up = no UX penalty)
+Training jobs: Kubernetes Jobs with configurable hardware (CPU cores, memory, GPU count)
+Parallelization: multiple jobs with different hyperparameters / configs run concurrently
+Container-per-model-version: diverse library versions (sklearn, XGBoost, PyTorch, TF) coexist
+```
+
+**Architecture:**
+```
+User selects: hardware config + base image → K8s pod spins up in seconds
+"Save Model": snapshots code + deps as new Docker layer → ECR
+Storage: AWS EFS mounted as K8s volume (survives ephemeral container loss)
+Metadata: AWS Aurora RDS (ownership, run history, metrics)
+Training data: Hive, Presto, or Spark queries
+```
+
+**Layered API principle:** REST API → CLI → GUI, each built on the layer below — programmatic access is always the canonical interface.
+
+### Amundsen — Data Discovery at Lyft
+
+**Result:** time to discover a data artifact reduced to **5% of baseline** (20x improvement). Data grew 40x over ~10 years.
+
+```
+Search: Google-like full-text search (table name, column name, descriptions)
+Ranking: PageRank-style from query audit logs (highly queried = higher rank) — auto-generated, no human curation
+Column stats: count, null, zero, min, max, avg — computed over last day's partition
+Graph DB backend: people + table nodes, usage edges → PageRank popularity scoring
+Security model: existence + fundamental metadata visible to all; richer stats gated on data permissions
+  ("security by obscurity is wrong — fix the data model instead of hiding existence")
+```
+
+**GDPR use case:** tag PII fields in metadata graph → auto-fulfill data-subject requests.
+
+---
+
+## Uber AI/ML Scaling (Michelangelo)
+
+**Infrastructure:** Michelangelo Job Controller — unified federation layer over multiple Kubernetes clusters across AZs/regions; abstracts cluster topology from ML engineers.
+
+```
+Workload routing by SKU: A10 GPUs → serving (lower latency); H100/A100 → training
+Tiered memory: GPU VRAM → CPU system memory → NVMe offload (LLM training)
+Full-mesh NVLink within nodes; inter-node network: 25 GB/s → 100 GB/s (4x upgrade)
+QoS/isolation: dedicated rack + network topologies (training elephant flows isolated from serving)
+```
+
+**Concrete improvements:**
+```
+Network upgrade:          2x training throughput
+Memory offloading:        2x MFU (Model Flops Utilization), 34% GPU usage reduction
+H100 vs A100:             4x TFlops, 2x memory bandwidth
+LLM serving framework B vs TRT-LLM on H100: 2x latency, 6x throughput
+Reactive scheduling:      opportunistic training during serving off-peak windows
+DIMM upgrade (16→32 GB):  unlocked GPU allocation rates on legacy racks
+```
+
+**GPU SKU selection** (17 variants benchmarked): tree-based models → small CPU instances; DL → A10/A100; LLM training → H100 + NVMe offload.
+
+---
+
+## Distributed ML Pipelines
+
+### Gradient Boosted Trees at Scale (Yelp — CTR Prediction)
+
+**Infrastructure:** 50 machines, 36 cores + 60 GB RAM each, 5 XGBoost workers/node, AWS EMR + YARN.
+
+```
+Dataset: hundreds of millions of training samples
+Training time: was ~2 days for 1/10 dataset → now < 3 hours at full scale
+Accuracy: 4% MXE improvement on test set
+Cost: 1/3 of original
+```
+
+**Critical YARN config:**
+```
+DominantResourceCalculator (CPU+memory) instead of DefaultResourceCalculator (memory-only)
+→ accounts for CPU in allocation — mandatory for CPU-bound XGBoost workloads
+Without it: memory allocation succeeds but cores are starved; workers underutilize
+```
+
+**XGBoost tuning:**
+```
+method: "approx" (bins continuous features → faster tree construction)
+max_delta_step: prevents gradient explosion on imbalanced click data
+early_stopping: balances accuracy vs. scoring latency
+Incremental retraining: "refresh" updater for cheap updates on new data
+Checkpointing: automated retry on failure
+Network saturation: horizontal scaling has diminishing returns past cluster optimum — identify empirically
+```
+
+### ML for Payments Retry Optimization (Dropbox)
+
+**Problem:** monolithic payment platform embedded prediction logic — 2-minute average p99 per prediction.
+
+**Solution:** extracted dedicated gRPC Predict Service.
+
+```
+Before: ~2 minutes average p99
+After:  < 300ms p99 (400x improvement)
+
+Model: gradient boosted ranking model
+Input: usage patterns, payment history, failure details
+Output: ranked 1-hour time chunks over 4/6/8-day retry window (192 chunks for 8-day)
+Feature store: Edgestore (KV store) populated daily by Airflow jobs
+```
+
+**Key lesson:** extracting ML serving into a dedicated service decouples deployment cycles, enables independent scaling, and eliminates latency from monolith dependency chains.
+
+### ML Workflows (Twitter)
+
+**Platform:** Apache Airflow on Apache Aurora, Celery with MySQL as message queue (no separate Redis/RabbitMQ).
+
+```
+Timelines Quality team: model retraining 4 weeks → 1 week → measurable improvement in ranking quality
+Custom operators: Aurora, DeepBird (train/serve/load-test), hyperparameter tuning, HDFS/CI utilities
+XCom type checking: validates data types between operators at DAG definition time (not runtime)
+Hyperparameter tuning: DAG-of-subdags pattern, random search + grid search; Bayesian planned
+```
+
+**Stateless container survival:** DAG instances persisted to MySQL → auto-recreated on pod restart.
+
+### Privacy-Preserving Analytics (LinkedIn PriPeARL)
+
+**Architecture:** Kafka events → batch/intra-day pipeline → Pinot → Privacy Mechanism → noisy response.
+
+**Noise approach: deterministic pseudorandom (hash-based), not true DP randomness:**
+```
+Prevents averaging attacks while maintaining latency SLA
+Hash function + double (vs BigDecimal) floating-point: "reduced latency significantly"
+Hierarchical time-range partitioning: atomic boundaries bound member event frequency across query ranges
+Post-processing: negative noisy counts capped at zero; high-relative-noise results suppressed
+```
+
+---
+
+## Flickr Similarity Search — LOPQ at 1 Billion Photos
+
+**Algorithm:** LOPQ (Locally Optimized Product Quantization) for ANN at billion scale.
+
+```
+Feature: deep neural network scene recognition; internal pre-softmax vector used
+Compression: 8 bytes/image (vs ~1 TB raw for 256-dim float vectors at 1B scale)
+Partitioning: k=1000 × k=1000 = 1 million partitions (1000x fewer distance computations)
+```
+
+**Multi-index construction:**
+```
+Split feature vector in 2 halves → cluster each independently (k=1000 per half)
+→ k² = 1 million partitions (multi-index)
+Residual quantization on approximation errors → compressed code storage
+Local PCA rotation per cluster: fits local data distribution, reduces quantization error
+Variance balancing: PCA dimension permutation distributes information evenly across splits
+```
+
+**Performance:**
+- 1000x reduction in distance computations vs. brute-force
+- Distance caching: precomputed squared differences per quantization split (avoid per-query arithmetic)
+- Product quantization independence assumption violated in practice → mitigated by per-cluster PCA rotations
+
+---
+
+## Experimentation Platform (Spotify)
+
+**Architecture:** domain-based bucket pool — experiments consume slices, released buckets unusable until carryover period expires.
+
+```
+Assignment: HASH(user_id, SALT) % bucket_count → each experiment gets its own salt
+Carryover prevention: new salts on release shuffle users into new buckets
+Holdback groups: quarterly exemptions from all experiments → measure cumulative treatment effect
+Compensation factor: 1 / traffic_fraction (e.g. 50% traffic → 2x overallocation needed)
+Hard stop: compensation factor > 5 → stop starting new experiments (too many wasted users)
+```
+
+**Validity checks:**
+- Sample ratio mismatch (actual vs. targeted exposure)
+- Pre-exposure activity parity between groups
+- Client crash monitoring
+- Remote config property collision warnings
+
+**Statistical modes:** sequential (real-time with multiple comparison corrections) or fixed-horizon (post-experiment). Superiority tests for success metrics; non-inferiority tests for guardrails.
+
+**Weekday bias:** gradual ramp-up assignment over time to smooth day-of-week effects.
+
+---
+
 ## See Also
 
 - [Real-Time Analytics Architectures](24-realtime-analytics-architectures.md) — AresDB, AthenaX, Pinot, Lambda vs Kappa

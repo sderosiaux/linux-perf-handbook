@@ -407,6 +407,87 @@ sysctl -w vm.dirty_background_ratio=10
 
 ---
 
+## Netflix Keystone — Stream Processing at 1 Trillion Events/Day
+
+**Scale:** 130M subscribers, 190+ countries, trillions of events/day, thousands of concurrent streaming jobs.
+
+### Architecture
+
+```
+One isolated Flink cluster per job (not shared)
+Container runtime: Netflix Titus (CPU/memory/network isolation)
+Deployment: Spinnaker → Titus
+State: ZooKeeper (consensus) + S3 (checkpoint/savepoint storage)
+Source of truth: AWS RDS (desired goal states) — entire system reconciles against it
+```
+
+**Declarative reconciliation model:** Users declare goal state via UI/API; platform drives current → goal autonomously. All operations are idempotent — transient failures self-resolve.
+
+**Self-healing monitor (per-job, inside each Flink cluster):**
+- Detects Task Manager drift vs. container runtime view
+- Stalled Job Manager leader election
+- Unstable / periodically-restarting task managers
+- Network partition on any container
+- Blast radius isolation: each job = independent Flink cluster
+
+**Job diversity / configuration knobs:**
+```
+State size:   stateless → 10s of TB local state
+Window sizes: seconds → hours-long custom session windows
+Failure recovery: seconds target (harder with large state + shuffling stages)
+
+Stateless redeployment: low-latency (may duplicate) vs. low-duplicate (higher latency)
+Stateful redeployment: resume from checkpoint/savepoint or start fresh
+Backfill: dynamic source switching (stateless only) or rewind to checkpoint
+Connectors: Kafka, Elasticsearch, Hive — dynamic source/sink switching without rebuild
+```
+
+**ZooKeeper state corruption recovery:** full cluster rebuild from RDS source of truth.
+
+---
+
+## Netflix Delta — CDC + Data Synchronization
+
+**Problem:** Multi-store sync (MySQL → Elasticsearch + Memcached) via dual writes or distributed transactions both fail:
+- Dual writes: second-write failure diverges stores permanently
+- XA transactions: block on process crash, no deadlock detection, ES doesn't support XA
+
+### Kafka Cluster Config (High-Durability vs Standard)
+
+| Config | Standard Keystone Kafka | Delta's special cluster |
+|---|---|---|
+| `unclean.leader.election.enable` | `true` | **`false`** |
+| Replication factor | 2 | **3** |
+| Min in-sync replicas | 1 | **2** |
+| Producer acks | 1 | **`all`** |
+| Broker storage | Local disks | **EBS volumes** |
+
+**EBS impact on broker replacement:** new instance attaches prior broker's EBS volume → catch-up time from **hours → minutes**. Decoupled storage/broker lifecycles drastically reduce recovery blast radius.
+
+### Delta-Connector (CDC Service)
+
+```
+Sources: MySQL binlog, Postgres WAL, Cassandra (multi-master), DynamoDB streams
+Full dump: manual trigger (entire DB, specific table, or specific PKs)
+Chunked dumps: failure mid-dump resumes from chunk, not from scratch
+No table locks during dumps (never blocks write traffic)
+HA: standby instances across AWS AZs
+```
+
+**Data flow (Movie Search example):**
+```
+MySQL mutation → Delta-Connector → Kafka → Delta Flink app
+    → enrichment calls (Deal Service, Talent Service, Vendor Service)
+    → Elasticsearch index (near real-time)
+```
+
+**Delta Stream Processing (on SPaaS/Flink):**
+- Annotation-driven DSL — users write enrichment logic; Flink details abstracted
+- Built-in: deduplication, schematization, fault tolerance
+- Self-service UI for Flink job deployment + dynamic config changes without recompile
+
+---
+
 ## Inaccessible Articles (403 / ECONNREFUSED)
 
 - Netflix Keystone (medium.com, 403)
