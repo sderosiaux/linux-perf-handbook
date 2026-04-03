@@ -896,7 +896,55 @@ cat /proc/meminfo | grep Huge
 
 ## io_uring for Networking (5.19+)
 
+> Source: Jasny et al., "io_uring for High-Performance DBMSs: When and How to Use It", PVLDB 2026. [arXiv:2512.04859](https://arxiv.org/abs/2512.04859)
+
 io_uring provides significant performance improvements for network I/O, with major enhancements in 6.x kernels.
+
+### When io_uring Actually Helps
+
+- **High I/O concurrency is required.** At low concurrency, `pread`/`pwrite` is equivalent or better — io_uring adds setup cost for nothing.
+- **Without I/O batching, io_uring ties you to device latency.** A naive 1-SQE-at-a-time submission gives no advantage over sync I/O.
+- **Async execution model is a prerequisite.** Coroutines or fibers that yield on I/O are needed to generate high queue depth. Without them, you can't fill the SQ fast enough to benefit from batching.
+
+### Threading & Topology
+
+**Ring-per-thread** with computation and I/O colocated on the same thread. Pin worker threads and NICs to the same chiplet (chiplets = groups of cores sharing L3 cache). This is effectively **thread-per-core with ring-per-core**.
+
+Each thread owns its SQ/CQ exclusively — no cross-thread synchronization on the ring.
+
+```bash
+# Pin thread to cores 0-3 (same chiplet as NIC IRQs)
+taskset -c 0-3 ./my_server
+
+# Verify NIC IRQ affinity matches
+cat /proc/irq/<NIC_IRQ>/smp_affinity_list
+```
+
+### Registered Buffers
+
+Pre-register buffers with `io_uring_register_buffers` up front. Avoids per-I/O cost of validating user pages and pinning physical pages for DMA access. Significant win under high IOPS.
+
+### SQPoll Mode
+
+`IORING_SETUP_SQPOLL`: kernel thread continuously polls SQ for entries. **Burns a CPU core** but eliminates all submit syscalls. Use in high-throughput I/O scenarios where a dedicated poll core is acceptable.
+
+### NVMe Passthrough + IOPoll
+
+`IORING_SETUP_IOPOLL`: kernel polls NVMe device for completions instead of waiting for interrupts. Bypasses block layer and interrupt overhead. **Burns a CPU core.** Reserve for sustained high-load storage paths.
+
+### Zero-Copy Network
+
+Zero-copy send + recv via io_uring gives benefit over epoll **only for messages above ~1 KiB**. Below that, the setup overhead (page pinning, notification) dominates. For small messages, epoll + `send()`/`recv()` remains competitive.
+
+### io_uring Performance Checklist
+
+1. Async execution model (coroutines/fibers) — generate high queue depth
+2. Adaptive batching — don't submit one SQE at a time
+3. Ring-per-thread, pin to chiplet — no cross-thread ring sharing
+4. Register buffers up front — eliminate per-I/O page pinning
+5. SQPoll for high-throughput paths — trade a core for zero syscalls
+6. NVMe passthrough + IOPoll for storage — trade a core for minimal latency
+7. Zero-copy network only above ~1 KiB message size
 
 ### Key Features by Kernel Version
 

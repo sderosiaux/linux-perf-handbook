@@ -386,6 +386,101 @@ df -T /data | awk '{print $2}'   # check filesystem type
 lsblk -d -o NAME,ROTA | grep " 1$"  # ROTA=1 = rotational (HDD)
 ```
 
+## io_uring for Storage I/O
+
+> Source: Jasny et al., "io_uring for High-Performance DBMSs: When and How to Use It", PVLDB 2026. [arXiv:2512.04859](https://arxiv.org/abs/2512.04859)
+
+io_uring replaces `libaio` and `pread`/`pwrite` for high-performance storage. But naively swapping the interface yields no gain — the benefit comes from batching and concurrency.
+
+### When io_uring Beats pread/pwrite
+
+- **Only at high I/O concurrency.** At low concurrency (single-threaded sequential reads), `pread`/`pwrite` is equivalent or better.
+- Without I/O batching, io_uring ties you to device latency — 1 SQE at a time = same as sync I/O.
+- Async execution model (coroutines/fibers) is a prerequisite to generate high queue depth.
+
+### Adaptive Batching
+
+Don't submit SQEs one at a time. Use a counter to track pending SQEs and determine how many to submit at once:
+
+```
+While processing:
+  1. Prepare SQE, increment counter
+  2. If counter >= threshold OR coroutine about to yield:
+     io_uring_submit()  // submit batch
+     counter = 0
+```
+
+This adapts to load automatically — under high concurrency, batches grow naturally.
+
+### Threading Model
+
+**Ring-per-thread** with computation and I/O colocated on the same thread. Pin worker threads and NVMe devices to the same chiplet (cores sharing L3).
+
+```bash
+# Identify NVMe IRQ CPU affinity
+cat /proc/irq/$(cat /sys/block/nvme0n1/device/irqs | head -1)/smp_affinity_list
+
+# Pin worker to matching cores
+taskset -c 0-3 ./db_server
+```
+
+### Registered Buffers
+
+```c
+// Register once at startup — avoids per-I/O page validation + DMA pinning
+struct iovec iovecs[N];
+// ... allocate aligned buffers ...
+io_uring_register_buffers(&ring, iovecs, N);
+
+// Use registered buffers in SQEs
+io_uring_prep_read_fixed(sqe, fd, buf, len, offset, buf_index);
+```
+
+### SQPoll + IOPoll for Maximum IOPS
+
+```c
+struct io_uring_params params = {
+    .flags = IORING_SETUP_SQPOLL    // kernel thread polls SQ — no submit syscalls
+           | IORING_SETUP_IOPOLL,   // kernel polls NVMe — no completion interrupts
+    .sq_thread_idle = 2000,         // ms before kernel thread sleeps
+};
+io_uring_queue_init_params(depth, &ring, &params);
+```
+
+**Trade-off:** burns 1-2 CPU cores (one for SQ poll, one for IO poll). Use only under sustained high IOPS where the core cost is justified.
+
+### NVMe Passthrough
+
+Bypasses filesystem, block layer, and page cache entirely. Maximum IOPS path:
+
+```c
+// io_uring + NVMe passthrough (kernel 6.2+)
+io_uring_prep_cmd(sqe, IORING_CMD_FIXED, nvme_fd, ...);
+```
+
+### fio with io_uring
+
+```bash
+# Benchmark io_uring vs libaio
+fio --name=test --ioengine=io_uring --rw=randread --bs=4k \
+    --size=1G --direct=1 --iodepth=128 --numjobs=4 \
+    --hipri=1 --sqthread_poll=1  # enable IOPoll + SQPoll
+
+# Compare with libaio
+fio --name=test --ioengine=libaio --rw=randread --bs=4k \
+    --size=1G --direct=1 --iodepth=128 --numjobs=4
+```
+
+### Storage io_uring Checklist
+
+1. Async execution model (coroutines/fibers) — fill the queue
+2. Adaptive batching with counter — submit in bursts, not one-by-one
+3. Ring-per-thread, pin to NVMe chiplet — avoid cross-NUMA
+4. Register buffers at startup — skip per-I/O page pinning
+5. SQPoll for write-heavy paths — trade a core for zero syscalls
+6. IOPoll + NVMe passthrough for read-heavy IOPS — trade a core for no interrupts
+7. At low concurrency, just use pread/pwrite
+
 ## Quick Reference
 
 | Task | Command |
