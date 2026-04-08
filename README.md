@@ -43,6 +43,7 @@ Symptom → 60-Second Analysis → Identify resource bottleneck → Deep dive ch
 | [18 - VDSO & Clock Source](18-vdso-clock-source-tuning.md) | Time syscalls, TSC, cloud VM performance |
 | [18 - Off-CPU Analysis](18-off-cpu-analysis.md) | Wall-clock profiling, blocking detection, load-scaling bottlenecks |
 | [19 - Storage Engine Patterns](19-storage-engine-patterns.md) | LMDB, RocksDB, LSM, columnar, vectorized engines |
+| [26 - C++ HFT Optimization Patterns](26-cpp-hft-optimization-patterns.md) | SwissTable/F14, branchless, hugepages, FastQueue, kernel bypass, 30 LLM-actionable levers |
 
 ### Advanced Topics & Production Patterns
 
