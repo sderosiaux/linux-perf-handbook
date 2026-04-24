@@ -44,6 +44,15 @@ Symptom → 60-Second Analysis → Identify resource bottleneck → Deep dive ch
 | [18 - Off-CPU Analysis](18-off-cpu-analysis.md) | Wall-clock profiling, blocking detection, load-scaling bottlenecks |
 | [19 - Storage Engine Patterns](19-storage-engine-patterns.md) | LMDB, RocksDB, LSM, columnar, vectorized engines |
 | [26 - C++ HFT Optimization Patterns](26-cpp-hft-optimization-patterns.md) | SwissTable/F14, branchless, hugepages, FastQueue, kernel bypass, 30 LLM-actionable levers |
+| [27 - Compact Integer Sets](27-compact-integer-sets.md) | Roaring bitmaps, Elias-Fano/PEF, Bloom/Cuckoo/XOR/Binary Fuse, ART — decision matrix + heuristics |
+| [28 - Probabilistic Sketches](28-probabilistic-sketches.md) | HLL/UltraLogLog, Count-Min, t-digest/DDSketch/KLL, Theta, MinHash/LSH — cardinality, frequency, quantile |
+| [29 - Vector ANN Indexes](29-vector-ann-indexes.md) | HNSW, IVF-PQ, DiskANN, SCANN, filtered ANN, hybrid search — recall vs latency, pgvector/FAISS/Qdrant |
+| [30 - Hash Tables at Scale](30-hash-tables-at-scale.md) | SwissTable/F14/hashbrown, Robin Hood, Cuckoo, MPHF/PTHash/RecSplit, hash DoS, concurrent maps |
+| [31 - Columnar Encoding Cookbook](31-columnar-encoding-cookbook.md) | Dict, RLE, FOR/PFOR, Gorilla/Chimp/ALP, FSST, Zstd dict — Parquet/ORC/Arrow/ClickHouse |
+| [32 - Ordered/Range/Spatial Structures](32-ordered-range-spatial-structures.md) | Skip list, Bw-tree, Fenwick, Segment tree, BKD, R-tree, H3/S2, space-filling curves |
+| [33 - Compressed Strings & Tries](33-compressed-strings-and-tries.md) | FST, FSST, Patricia, DAWG, front-coding, FM-index, wavelet trees, LOUDS — Lucene/Tantivy/DuckDB |
+| [34 - Learned Indexes](34-learned-indexes.md) | RMI, PGM-index, ALEX, learned Bloom — honest 2026 verdict vs B-tree/ART |
+| [35 - LSM Compaction Strategies](35-lsm-compaction-strategies.md) | Leveled/STCS/Universal/FIFO/TWCS, Dostoevsky, Monkey, Wacky, tombstones, RUM conjecture |
 
 ### Advanced Topics & Production Patterns
 
