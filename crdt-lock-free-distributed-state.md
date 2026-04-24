@@ -144,6 +144,8 @@ Merge: if (remote.timestamp > local.timestamp) OR
 - **HLC (Hybrid Logical Clock):** Lamport + physical time, better debugging
 - **Physical timestamp:** Requires synchronized clocks (NTP)
 
+**Related: same math, different problem domains.** Stream dataflow engines (Flink barriers, RisingWave epochs, Naiad pointstamps) use the same logical-clock machinery for progress tracking instead of conflict resolution. See [`24-realtime-analytics-architectures.md`](24-realtime-analytics-architectures.md#distributed-time-in-stream-engines--lineage) for the Lamport → vector clock → pointstamp → watermark lineage.
+
 **Use cases:**
 - User profile fields
 - Configuration values

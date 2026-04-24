@@ -271,6 +271,7 @@ Not explicitly quantified. Flow: `SDK → enrichment → Kafka → Flink → Kaf
 | AthenaX | Kappa | Flink on YARN | Kafka output | No | Milliseconds |
 | Maze | Hybrid | AthenaX + Spark | MemSQL + Redis | No | Not disclosed |
 | Healthline (Pinot) | Hybrid Lambda | Flink + Kafka | Apache Pinot (RT+offline) | No | Sub-minute |
+| RisingWave | Kappa (SQL MVs) | Rust/Tokio async | Hummock LSM on S3 (shared) | No | ~1s (checkpoint floor) |
 
 ---
 
@@ -485,6 +486,186 @@ MySQL mutation → Delta-Connector → Kafka → Delta Flink app
 - Annotation-driven DSL — users write enrichment logic; Flink details abstracted
 - Built-in: deduplication, schematization, fault tolerance
 - Self-service UI for Flink job deployment + dynamic config changes without recompile
+
+---
+
+## RisingWave — Streaming SQL with Decentralized State
+
+**Source:** RisingWave Labs OSS codebase (`github.com/risingwavelabs/risingwave`, verified against `src/stream/`, `src/storage/hummock`, `src/meta/` at commit `aaa8dbd3b4`).
+
+Postgres-compatible streaming DB. Same problem class as Flink + Materialize (incremental materialized views over unbounded streams) but with a distinctive operational posture.
+
+### Architectural Pipeline
+
+```
+SQL
+ └─ frontend (Calcite-style planner)        src/frontend/
+      └─ streaming physical plan (protobuf)
+           └─ meta scheduler                src/meta/src/stream/
+                │  fragments the DAG, assigns actors to compute nodes
+                ▼
+           compute nodes                    src/stream/
+             from_proto/ → Executor tree
+             Actor::run() loop driven by barriers
+                │
+                ├─ state → Hummock (shared LSM on S3)    src/storage/hummock/
+                └─ output → Dispatcher → downstream fragment or Sink
+```
+
+**Key distinction vs Flink:** state lives in **Hummock**, a shared LSM backed by S3, not in per-task RocksDB. Scaling = redistributing vnodes, new actors load state from object storage. No stateful rebalancing cost.
+
+### Execution Model — Pull-Based Async Streams
+
+The operator contract (`src/stream/src/executor/mod.rs:240`):
+
+```rust
+pub trait Execute: Send + 'static {
+    fn execute(self: Box<Self>) -> BoxedMessageStream;
+}
+```
+
+An operator = `self → Stream<Message>`. Composed with `#[try_stream]` (futures-async-stream). No event loop — Tokio scheduler drives the pipeline; backpressure is `await`-native.
+
+`Message` variants flowing between operators:
+
+| Variant | Payload | Role |
+|---|---|---|
+| `Chunk(StreamChunk)` | Columnar batch with `Op` per row: `Insert` / `Delete` / `UpdateInsert` / `UpdateDelete` | The **delta** — retractions enable correct incremental joins/aggs |
+| `Barrier(Barrier)` | `EpochPair{prev, curr}` + optional `Mutation` | Dual-purpose: checkpoint marker **and** reconfiguration command |
+| `Watermark(Watermark)` | Lower bound on event-time for a column | Window close, late-data filter, TTL |
+
+### Barriers = Chandy-Lamport + Control Plane
+
+Injected ~1Hz by the meta node. Propagation rule at every operator: receive `Barrier(N)` on all upstreams → align → flush state to epoch `N` → forward downstream → `StateTable.commit(N)` to Hummock.
+
+Reconfiguration piggybacks on barriers via `Mutation` (`src/stream/src/executor/mod.rs:362`):
+
+```
+Mutation::Add / Update / Stop / Pause / Resume
+         / Throttle / SourceChangeSplit / StartFragmentBackfill / ...
+```
+
+Epoch N-1 runs with old topology, N with new — atomically. Scale up/down, add MV, pause a source: all zero-downtime.
+
+### Sharding — vnodes
+
+Default **256 vnodes** per fragment (`VirtualNode::COUNT_FOR_COMPAT = 1 << 8`, `src/common/src/hash/consistent_hash/vnode.rs:62`). An actor owns a vnode bitmap. Rebalancing = redistribute vnodes across actors; Hummock keys are vnode-prefixed so state "moves" implicitly.
+
+### Backfill — The Non-Obvious Part
+
+`CREATE MV AS SELECT ...` over an existing table must snapshot historical data **while** new mutations arrive (`src/stream/src/executor/backfill/`, `chain.rs`, `rearranged_chain.rs`). Interleaves:
+- Batch scan cursor over base table
+- Live CDC stream from upstream
+
+Upstream updates are filtered against the scanned-prefix boundary. When cursor reaches end → switch to pure streaming.
+
+### vs Flink / Materialize — Tradeoff Matrix
+
+| Axis | RisingWave | Flink | Materialize |
+|---|---|---|---|
+| State backend | Hummock LSM on S3 (shared) | RocksDB local per task | Timely in-memory + persist layer |
+| Rescale cost | Seconds (vnode reassignment, state on S3) | Minutes (restore from checkpoint) | Seconds–minutes |
+| Theoretical model | Retraction streams, no cycles | Retraction + append, barriers | Timely dataflow + differential |
+| Watermark model | Scalar per column, `min` on merge | Scalar per column, `min` on merge | Multi-dim pointstamps (frontiers) |
+| Primary interface | SQL only | DataStream API + SQL | SQL only |
+| Runtime | Tokio async, pull-based | JVM threads, push-based | Rust timely, push-based |
+
+**When RisingWave wins:** cloud-native deployments where S3-based state means you pay object-storage prices for large state instead of provisioning local NVMe; frequent topology changes (adding MVs, rescaling).
+
+**When Flink wins:** ultra-low-latency (sub-10ms), complex DataStream logic that SQL can't express, mature ecosystem of connectors.
+
+**When Materialize wins:** correctness-critical workloads where differential dataflow's formal guarantees matter; iterative/recursive queries.
+
+### Operational Observations
+
+- **Checkpoint interval ~1s** → p99 latency floor is the checkpoint period for consistent reads.
+- **Hummock compaction** is the LSM-level concern — see `35-lsm-compaction-strategies.md`. Compactor is a separate service, can be scaled independently.
+- **Barrier alignment** is the typical stall point: one slow upstream delays the whole epoch. Monitor `actor_current_epoch` metric to find laggards.
+- **Backpressure** surfaces as growing gap between `prev_epoch` and wall clock at a source operator.
+
+---
+
+## Distributed Time in Stream Engines — Lineage
+
+The mechanism every stream engine uses to reason about progress descends from the same theoretical root. Naming it explicitly helps cross-reference across systems.
+
+### The Academic Chain
+
+```
+Lamport 1978 ("Time, Clocks, and the Ordering of Events")
+  └─ scalar logical clock, C(a) < C(b) if a → b causally
+       │
+       ▼
+Mattern/Fidge 1988 (vector clocks)
+  └─ V[i] per process, partial order detects true concurrency
+       │
+       ├─ Chandy-Lamport 1985 (distributed snapshot)
+       │    └─ "marker" messages sweep the graph → consistent cut
+       │         │
+       │         ▼
+       │    Carbone et al. 2015 (Flink ABS)
+       │         └─ barriers = markers specialized for dataflow
+       │
+       ▼
+Naiad / Murray-McSherry 2013 ("Timely Dataflow")
+  └─ pointstamp = (epoch, loop_1, loop_2, ...) — vector clock for dataflow
+  └─ frontier = min of in-flight pointstamps — progress guarantee
+       │
+       ├─ Differential Dataflow / Materialize
+       │    └─ keeps full pointstamp lattice
+       │
+       └─ Flink / RisingWave
+            └─ simplified: scalar epoch + scalar watermark per column
+            └─ loses: cycles, nested iteration scopes
+            └─ gains: simpler implementation, adequate for SQL MVs
+```
+
+### What Each System Actually Implements
+
+| System | Progress primitive | Math object | Detects concurrency? |
+|---|---|---|---|
+| Kafka consumer offsets | Per-partition offset | Vector of scalars, no causality | No (append-only log) |
+| Flink barriers | Global epoch counter | Lamport scalar | No (total order by design) |
+| Flink watermarks | Per-column event-time bound | Lamport scalar | No |
+| RisingWave `EpochPair` | Global checkpoint epoch | Lamport scalar | No |
+| RisingWave watermark | Per-column event-time bound | Lamport scalar | No |
+| Naiad pointstamp | `(epoch, *loop_counters)` | Vector clock, partial order | **Yes** (cycles + event-time) |
+| Materialize frontier | Antichain of pointstamps | Semi-lattice | **Yes** |
+| CRDT version vector | `[node_id → counter]` | Vector clock | **Yes** (concurrent writes) |
+| HLC | Physical time + logical counter | Lamport + wall clock | No (total order) |
+
+See also: [`crdt-lock-free-distributed-state.md`](crdt-lock-free-distributed-state.md) for vector clocks applied to replicated state (same math, different problem).
+
+### The Merge Rule — Same Pattern Everywhere
+
+When data from multiple streams/nodes meets:
+
+- **Lamport on receive:** `C := max(C_local, C_received) + 1`
+- **Vector clock on receive:** `V[i] := max(V_local[i], V_received[i])` for all i
+- **Watermark at merge/join:** `W_out := min(W_in_1, W_in_2, ...)`
+- **Frontier advancement:** `F := min over all in-flight pointstamps`
+
+`max` when reconstructing "what has happened" (causality), `min` when computing "what is guaranteed complete" (frontier). Same algebra, dual operations on the same lattice.
+
+### Why Simplification Works for SQL MVs
+
+SQL materialized views don't express cycles (no tail-recursive CTE in streaming). Therefore:
+- No need for loop counters in timestamps → epoch scalar is sufficient
+- No need for full lattice frontier → per-column scalar watermark is sufficient
+- Retractions handle "update" semantics → no need for pointstamp diffs
+
+TRADEOFF: can't express iterative computations (graph algorithms, fixed-point queries) without external orchestration. If you need those → Materialize or raw Timely.
+
+### Practical Debugging Implications
+
+When a stream pipeline stalls, the question is always: **which progress primitive is stuck?**
+
+| Symptom | Which clock is stuck | Where to look |
+|---|---|---|
+| No output, epoch advancing | Watermark not advancing | Upstream source idle detection, event-time extractor |
+| Epoch not advancing | Barrier blocked | Slowest upstream actor, state flush latency |
+| Output has "old" data only | Backfill not done | `BackfillExecutor` progress, base-table scan cursor |
+| Random ordering of updates | Retractions reordered | Join-key partitioning, shuffle correctness |
 
 ---
 
